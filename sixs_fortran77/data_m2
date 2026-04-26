@@ -1,0 +1,14 @@
+  0                            (USER'S CONDITIONS)
+  45.0 0 10 0 08 15
+  4                            (atmospheric conditions)
+  1                            (AEROSOLS MODEL)
+  0                            (NEXT VALUE IS THE AERO. OPT. THICK @ 550)
+  0.20                         (AEROSOL OPTICAL THICKNESS @550)
+  -0.05                         (TARGET AT 0.05 km)
+  0                         (AIRCRAFT AT 3.3 KM ABOVE GROUND LEVEL)
+  -2                           (jargm. rida min & max)
+  0.25 4.00
+  0                            (GROUND TYPE,I.E. UNIFORM SURFACE)
+  0                             (ainult sf‰‰riline)
+  1                             (taimkate)
+  -2.0                        (NO ATMOSPHERIC CORRECTION)

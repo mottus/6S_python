@@ -1,0 +1,17 @@
+  0                            (USER'S CONDITIONS)
+  40.0 100.0 45.0 50.0 7 23
+  8                            (USER'S  MODEL)
+  3.0   0.35                   (UH2O(G/CM2) ,UO3(CM-ATM))
+  4                            (AEROSOLS MODEL)
+  0.25  0.25  0.25  0.25       (% OF:DUST-LIKE,WATER-SOL,OCEANIC,SOOT)
+  0                            (NEXT VALUE IS THE AERO. OPT. THICK. @550)
+  0.50                         (AERO. OPT. THICK. @550)
+  -0.2                         (TARGET AT 0.2 km)
+  -3.3                         (AIRCRAFT AT 3.3 KM  ABOVE GROUND LEVEL)
+  -1.5  -0.35                  (UH2o and UO3 under the plane not available)
+  0.45              (AERO. OPT. THICK. under the plane @550)
+  -2                spectrometer mode
+  .550 .900
+  1                            (GROUND TYPE,I.E. NON UNIFORME SURFACE)
+  2    1    0.50               (TARGET,ENV.,RADIUS(KM))
+  -0.10                        (ATMOSPHERIC CORRECTION OF RAPP=0.10)

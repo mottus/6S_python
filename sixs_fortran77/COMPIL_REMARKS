@@ -1,0 +1,10 @@
+use the Makefile (make command) to compile the code.
+the executable is "sixs"
+
+for SUN /os  replace 
+  SYSTEM = hpux              by  SYSTEM = __sparc (or __SVR4)
+  EXTRA  = +O3 -D$(SYSTEM)   by  EXTRA  = -O -D$(SYSTEM)
+  FC     = f77               by  FC     = /usr/lang/f77 -Nl100
+
+
+for SUN /os IBM/rs6000 dec  you have to exec: ranlib sixslib.a

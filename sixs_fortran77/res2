@@ -1,0 +1,135 @@
+
+
+
+
+
+******************************* 6s version 4.1 ****************************** *
+*                                                                             *
+*                       geometrical conditions identity                       *
+*                       -------------------------------                       *
+*                       user defined conditions                               *
+*                                                                             *
+*   month:  7 day :  23                                                       *
+*   solar zenith angle:   40.00 deg  solar azimuthal angle:      100.00 deg   *
+*   view zenith angle:    45.00 deg  view azimuthal angle:        50.00 deg   *
+*   scattering angle:    146.49 deg  azimuthal angle difference:  50.00 deg   *
+*                                                                             *
+*                       atmospheric model description                         *
+*                       -----------------------------                         *
+*           atmospheric model identity :                                      *
+*             user defined water content : uh2o= 3.000 g/cm2                  *
+*             user defined ozone content : uo3 =  .350 cm-atm                 *
+*           aerosols type identity :                                          *
+*                user defined aerosols model                                  *
+*                            .250 % of dust-like                              *
+*                            .250 % of water-soluble                          *
+*                            .250 % of oceanic                                *
+*                            .250 % of soot                                   *
+*           optical condition identity :                                      *
+*                visibility :  8.49 km  opt. thick. 550nm :  .5000            *
+*                                                                             *
+*                       spectral condition                                    *
+*                       ------------------                                    *
+*           constant                                                          *
+*               value of filter function :                                    *
+*                wl inf=  .445 mic   wl sup=  .450 mic                        *
+*                                                                             *
+*                       target type                                           *
+*                       -----------                                           *
+*           homogeneous ground                                                *
+*                Pinty and Verstraete's model selected                        *
+*                om: .800 rad : .010 lad  :1.000                              *
+*                multiple scattering (Dickinson et al)                        *
+*                Goudrian's parametrization of kappa :                        *
+*                     ksil: .200                                              *
+*                Heyney-Greenstein's phase function  :                        *
+*                    assym:-.400                                              *
+*                                                                             *
+*                brdf selected                                                *
+*                    rodir    robar    ropbar    albedo                       *
+*                   .4957     .4458     .4472     .4161                       *
+*                                                                             *
+*                       target elevation description                          *
+*                       ----------------------------                          *
+*           ground pressure  [mb] 1013.0000                                   *
+*           ground altitude  [km]  .000                                       *
+*                                                                             *
+*******************************************************************************
+
+
+
+*******************************************************************************
+*                                                                             *
+*                         integrated values of  :                             *
+*                         --------------------                                *
+*       apparent reflectance   .2437    appar. rad.(w/m2/sr/mic)    114.769   *
+*                   total gaseous transmittance   .997                        *
+*                                                                             *
+*******************************************************************************
+*                                                                             *
+*                         coupling aerosol -wv  :                             *
+*                         --------------------                                *
+*           wv above aerosol :    .244     wv mixed with aerosol :    .244    *
+*                       wv under aerosol :    .244                            *
+*                                                                             *
+*                         int. normalized  values  of  :                      *
+*                         ---------------------------                         *
+*                      % of irradiance at ground level                        *
+*     % of direct  irr.    % of diffuse irr.    % of enviro. irr              *
+*                .623                .332                .045                 *
+*                       reflectance at satellite level                        *
+*     atm. intrin. ref.   background  ref.  pixel  reflectance                *
+*                .135                .037                .074                 *
+*                                                                             *
+*                         int. absolute values of                             *
+*                         -----------------------                             *
+*                      irr. at ground level (w/m2/mic)                        *
+*     direct solar irr.    atm. diffuse irr.    environment  irr              *
+*             471.955             251.826              33.789                 *
+*                      rad at satel. level (w/m2/sr/mic)                      *
+*     atm. intrin. rad.    background  rad.    pixel  radiance                *
+*              63.379              17.320              34.673                 *
+*                                                                             *
+*                                                                             *
+*          int. funct filter (in mic)              int. sol. spect (in w/m2)  *
+*              .0050000                                   9.656               *
+*                                                                             *
+*******************************************************************************
+ 
+
+
+
+
+*******************************************************************************
+*                                                                             *
+*                          integrated values of  :                            *
+*                          --------------------                               *
+*                                                                             *
+*                             downward        upward          total           *
+*      global gas. trans. :     .99859         .99847         .99707          *
+*      water   "     "    :    1.00000        1.00000        1.00000          *
+*      ozone   "     "    :     .99859         .99847         .99707          *
+*      co2     "     "    :    1.00000        1.00000        1.00000          *
+*      oxyg    "     "    :    1.00000        1.00000        1.00000          *
+*      no2     "     "    :    1.00000        1.00000        1.00000          *
+*      ch4     "     "    :    1.00000        1.00000        1.00000          *
+*      co      "     "    :    1.00000        1.00000        1.00000          *
+*                                                                             *
+*                                                                             *
+*      rayl.  sca. trans. :     .86238         .85280         .73544          *
+*      aeros. sca.   "    :     .58496         .55767         .32622          *
+*      total  sca.   "    :     .48994         .46336         .22702          *
+*                                                                             *
+*                                                                             *
+*                                                                             *
+*                             rayleigh       aerosols         total           *
+*                                                                             *
+*      spherical albedo   :     .16370         .05785         .10719          *
+*      optical depth total:     .22723         .64692         .87415          *
+*      optical depth plane:     .22723         .64692         .87415          *
+*      reflectance        :     .13070         .03166         .13499          *
+*      phase function     :    1.26026         .29910         .54895          *
+*      sing. scat. albedo :    1.00000         .49938         .62951          *
+*                                                                             *
+*                                                                             *
+*******************************************************************************

@@ -1,0 +1,8 @@
+[Dolphin]
+AdditionalInfo=Details_Size,Details_Date,Details_Permissions,Details_Owner,Details_Type,Details_LinkDestination,CustomizedDetails
+AdditionalInfoV2=Details_Size,Details_Date,CustomizedDetails
+SortOrder=1
+SortRole=date
+Timestamp=2014,4,30,16,5,20
+Version=3
+ViewMode=1

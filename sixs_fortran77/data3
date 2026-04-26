@@ -1,0 +1,17 @@
+  0
+  45.0 0.0 0.0 0.0 7 23    
+  8                            (USER'S  MODEL)
+  3.0   0.35                   (UH2O(G/CM2) ,UO3(CM-ATM))
+  4                            (AEROSOLS MODEL)
+  0.25  0.25  0.25  0.25       (% OF:DUST-LIKE,WATER-SOL,OCEANIC,SOOT)
+  0                            (NEXT VALUE IS THE AERO. OPT. THICK. @550nm)
+  0.50                         (AERO. OPT. THICK. @550nm)
+  0.00                          (TARGET ALTITUDE IN KM)
+  -1000                        (SATELLITE CASE)
+  0                            (USER'S WLINF-WLSUP)
+  0.625 0.645                  (WLINF  WLSUP)
+  0                            (HOMOGENEOUS CASE)
+  1                            (DIRECTIONNAL EFFECTS)
+  3                            (Roujean et al, Model,plowed field)
+ 0.243 0.073 0.642             (k0,k1,k2)
+  -2.0                         (NO ATMOSPHERIC CORRECTION FOR BRDF)

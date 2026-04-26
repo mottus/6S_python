@@ -1,0 +1,26 @@
+0                         (USER'S CONDITIONS)
+61.23 0 18.78 159.2 4 30  (GEOMETRICAL CONDITIONS, MONTH, DAY OF MONTH)
+8                         (USER'S  MODEL)
+0.29 0.41                 (UH2O(G/CM2) ,UO3(CM-ATM))
+1                         (AEROSOLS MODEL)
+0                         (NEXT VALUE IS THE AERO. OPT. THICK. @550)
+0.14                      (AERO. OPT. THICK. @550)
+0                         (TARGET ALTITUDE IN KM)
+-1000                     (SATELLITE CASE)
+15                        (AVHRR CHANNEL 1(NOAA 11))
+0                         (HOMOGENEOUS CASE)
+0                         (NO DIRECTIONNAL EFFECTS)
+-1                (NEXT VALUES ARE THE GROUND REFL. BY STEP OF 0.0025mic)
+  .827  .828  .828  .827  .827  .827  .827  .826  .826  .826
+  .826  .825  .826  .826  .827  .827  .827  .827  .828  .828
+  .828  .829  .829  .828  .826  .826  .825  .826  .826  .826
+  .827  .827  .827  .826  .825  .826  .828  .829  .830  .831
+  .833  .834  .835  .836  .836  .837  .838  .838  .837  .836
+  .837  .837  .837  .840  .839  .840  .840  .841  .841  .841
+  .841  .842  .842  .842  .842  .843  .842  .843  .843  .843
+  .843  .843  .843  .841  .841  .842  .842  .842  .842  .842
+  .841  .840  .841  .838  .839  .837  .837  .836  .832  .832
+  .830  .829  .826  .826  .824  .821  .821  .818  .815  .813
+  .812  .811  .810  .808  .807  .807  .812  .808  .806  .807
+  .807  .807  .807
+-2            (NO ATMOSPHERIC CORRECTION)
