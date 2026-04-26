@@ -1,0 +1,12 @@
+# Python packaging
+*.egg-info/
+dist/
+build/
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+
+# editable install
+*.egg-link
+pip-wheel-metadata/
