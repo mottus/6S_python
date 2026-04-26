@@ -10,3 +10,5 @@ __pycache__/
 # editable install
 *.egg-link
 pip-wheel-metadata/
+sixs/__pycache__/interp.cpython-314.pyc
+/sixs/__pycache__
