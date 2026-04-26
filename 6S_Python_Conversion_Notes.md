@@ -8,10 +8,6 @@ files totalling approximately 30 500 lines**. The resulting Python package has *
 modules and ~17 000 lines** and preserves the same input/output interface as the
 original binary.
 
-The code originated from the Estonian Tartu Observatory and contains Estonian variable
-names (`m_korgus`, `m_h2o`, `m_aot`, `m_dir`, `m_dif`, `m_paev`, `m_kuu`) in the
-main output routine.
-
 ---
 
 ## Conversion Approach
