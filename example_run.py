@@ -12,13 +12,13 @@ or run directly without installing (the sixs/ folder must be here):
 """
 
 import io
-from sixs.sixs_main import run
+from sixs.sixs_main import run6S
 
 # simplest way to run on existing file
 fn = "data0"
 with open(fn) as f:
-    results = run(f)
-    # results = run(f, io.StringIO())   # redirect stdout to /dev/null
+    results = run6S(f)
+    # results = run6S(f, io.StringIO())   # redirect stdout to /dev/null
 
 # results['m_kuu']        # month
 # results['m_paev']       # day
@@ -83,7 +83,7 @@ input_text_1 = """
 print("=" * 60)
 print("Example 1: continental aerosol, sand surface, AVHRR band 1")
 print("=" * 60)
-r1 = run(io.StringIO(input_text_1))
+r1 = run6S(io.StringIO(input_text_1))
 
 print(f"  Apparent reflectance : {r1['apparent_reflectance']:.4f}")
 print(f"  Atmospheric path refl: {r1['srotot']:.4f}")
@@ -119,7 +119,7 @@ input_text_2 = """
 print("=" * 60)
 print("Example 2: atmospheric correction (retrieve surface refl.)")
 print("=" * 60)
-r2 = run(io.StringIO(input_text_2))
+r2 = run6S(io.StringIO(input_text_2))
 
 print(f"  Input apparent refl  : 0.18")
 print(f"  Retrieved surface refl: {r2['rog']:.4f}")
@@ -150,7 +150,7 @@ input_text_3 = """
 print("=" * 60)
 print("Example 3: Kuusk canopy BRDF, TM4 NIR")
 print("=" * 60)
-r3 = run(io.StringIO(input_text_3))
+r3 = run6S(io.StringIO(input_text_3))
 
 print(f"  Apparent reflectance : {r3['apparent_reflectance']:.4f}")
 print(f"  Ground direct irr.   : {r3['ground_direct_irr']:.1f} W/m²/µm")
@@ -182,7 +182,7 @@ for sza in [10, 20, 30, 40, 50, 60, 70]:
 3
 -2.0
 """
-    r = run(io.StringIO(inp))
+    r = run6S(io.StringIO(inp))
     print(f"  {sza:>6}°  {r['apparent_reflectance']:>8.4f}  {r['m_dir']:>12.2e}")
 
 
@@ -208,7 +208,7 @@ print("Example 5: run from configuration file  data0")
 print("=" * 60)
 
 with open("data0") as f:
-    r5 = run(f)
+    r5 = run6S(f)
 
 print(f"  Solar zenith angle   : {r5['m_korgus']:.1f}°")
 print(f"  Date                 : {r5['m_kuu']}/{r5['m_paev']}")

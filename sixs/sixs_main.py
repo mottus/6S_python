@@ -88,7 +88,7 @@ def _setup_gauss(mu, mu2, np_):
     return rm, gb, np.array(rp), np.array(gp)
 
 
-def run(input_stream=None, output_stream=None):
+def run6S(input_stream=None, output_stream=None):
     """
     Run the 6S radiative transfer model.
 
@@ -962,7 +962,7 @@ def run(input_stream=None, output_stream=None):
 
 def main():
     """Entry point for command-line use."""
-    results = run(sys.stdin, sys.stdout)
+    results = run6S(sys.stdin, sys.stdout)
     return 0
 
 

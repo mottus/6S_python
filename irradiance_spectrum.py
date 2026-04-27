@@ -19,7 +19,7 @@ Output columns (W/m²/µm):
 import io
 import warnings
 import numpy as np
-from sixs.sixs_main import run
+from sixs.sixs_main import run6S
 
 warnings.filterwarnings("ignore")
 
@@ -75,7 +75,7 @@ def run_spectrum(wl_grid, template):
         print("#", end="")
         inp = template.format(wl=f"{wl:.4f}")
         try:
-            r = run(io.StringIO(inp), io.StringIO())   # suppress Matti print line
+            r = run6S(io.StringIO(inp), io.StringIO())   # suppress Matti print line
             wl_out.append(wl)
             dir_out.append(r["m_dir"])
             dif_out.append(r["m_dif"])

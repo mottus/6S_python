@@ -16,7 +16,7 @@ Command-line (stdin/stdout, same interface as original Fortran):
 
 Programmatic:
 
-    from sixs.sixs_main import run
+    from sixs.sixs_main import run6S
     import io
 
     input_text = \"\"\"
@@ -37,12 +37,12 @@ Programmatic:
     -2.0
     \"\"\"
 
-    results = run(io.StringIO(input_text))
+    results = run6S(io.StringIO(input_text))
     print(results['apparent_reflectance'])
 """
 
-from .sixs_main import run, main
+from .sixs_main import run6S, main
 from .commons   import atm, delta_sigma, aer, disc, ffu
 
-__all__ = ['run', 'main', 'atm', 'delta_sigma', 'aer', 'disc', 'ffu']
+__all__ = ['run6S', 'main', 'atm', 'delta_sigma', 'aer', 'disc', 'ffu']
 __version__ = '4.1.0'
