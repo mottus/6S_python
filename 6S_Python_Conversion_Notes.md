@@ -8,6 +8,10 @@ files totalling approximately 30 500 lines**. The resulting Python package has *
 modules and ~17 000 lines** and preserves the same input/output interface as the
 original binary.
 
+The code originated from the Estonian Tartu Observatory and contains Estonian variable
+names (`m_korgus`, `m_h2o`, `m_aot`, `m_dir`, `m_dif`, `m_paev`, `m_kuu`) in the
+main output routine.
+
 ---
 
 ## Conversion Approach
@@ -321,9 +325,12 @@ model (`iaer` 0–11), all four Lambertian surface types, and all BRDF models
   SOS iteration in pure Python loops. This could be addressed with NumPy
   vectorisation or Numba JIT compilation.
 
-- **Fourier azimuth harmonics:** The SOS solver computes only the `is = 0`
-  (azimuthally isotropic) Fourier component. For nadir viewing this is exact
-  because higher harmonics vanish (`bp = 0` for `is > 0` when `xmuv = 1`). For
-  off-nadir views the missing harmonics introduce a small error in the azimuthal
-  distribution of path radiance, though the hemispherically-integrated quantities
-  (transmittances, spherical albedo) are unaffected.
+- **Fourier azimuth harmonics (aerosol SOS only):** The SOS solver computes
+  only the `is = 0` (isotropic) Fourier harmonic for the **aerosol
+  multiple-scattering** contribution. However, the Rayleigh reflectance is
+  computed analytically via the Chandrasekhar (1960) formula in `chand()`,
+  which includes the full azimuthal dependence through `cos φ` and `cos 2φ`
+  terms and is therefore exact at any viewing geometry. The practical impact of
+  the missing aerosol harmonics is negligible for clean atmospheres (low AOT);
+  for heavy aerosol loading combined with large off-nadir angles the error in
+  path radiance may reach a few percent.
