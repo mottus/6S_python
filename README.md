@@ -4,6 +4,7 @@ This is a python translation of the original scalar sixs fortran code. The origi
 
 To install, a simple "pip install -e ." in the folder containing this file should do.
 
+A script for atmospherically correcting Hyperion EO-1 images is included. It has a GUI, too, all coded by Claude. Again, no guarantees on accuracy!
 
 
 The original reference to whom all credit is due should be
