@@ -104,7 +104,86 @@ ENV_MODELS = {
 DEFAULT_ENV = "Vegetation"
 DEFAULT_ENV_RADIUS_KM = 2.0   # typical atmospheric PSF radius at low AOT
 
-VNIR_SWIR_BOUNDARY = 70   # bands 1-70 VNIR, 71+ SWIR (1-based)
+# ── Sensor profiles ───────────────────────────────────────────────────────────
+# Each profile defines the sensor-specific parameters that do not come from
+# the image header or the atmospheric model.
+#
+# Keys:
+#   display_name  : shown in the GUI dropdown
+#   sensor_type   : written to the ENVI output header
+#   input_type    : "radiance" — image stores DN or physical radiance,
+#                               ρ_toa = π·L/(E0·cos(SZA)), E0 from solirr()
+#                   "toa_refl" — image already stores TOA reflectance,
+#                               skip L→ρ_toa step
+#   rad_scale     : how to build the per-band radiance scale array.
+#                   "uniform:<val>"  — divide every band by <val>
+#                   "split:<vnir>:<swir>:<boundary>" — bands 1..<boundary>
+#                       divide by <vnir>, remainder by <swir> (1-based boundary)
+#                   "none"           — data already in W/m2/sr/um (scale = 1)
+#   pixel_size_m  : nominal ground sampling distance (used for adj2 default)
+#   vaa_source    : "orbit_eo1" — compute VAA from EO-1 orbital geometry
+#                   "manual"   — user must enter VAA directly
+#   notes         : free text shown as tooltip / help string
+
+SENSOR_PROFILES = {
+    "EO-1 Hyperion": {
+        "display_name": "EO-1 Hyperion",
+        "sensor_type":  "EO-1 Hyperion",
+        "input_type":   "radiance",
+        # VNIR (bands 1-70) scale 40, SWIR (bands 71-242) scale 80
+        # Units after scaling: W/m2/sr/um  (confirmed from NASA calibration docs)
+        "rad_scale":    "split:40:80:70",
+        "pixel_size_m": 30.0,
+        "vaa_source":   "orbit_eo1",
+        "notes": (
+            "EO-1 Hyperion pushbroom, 242 bands 356-2577 nm. "
+            "VNIR: bands 1-70, scale DN/40. SWIR: bands 71-242, scale DN/80. "
+            "VAA computed from orbital geometry (inclination 98.7 deg)."
+        ),
+    },
+    # ── Add further sensors below ─────────────────────────────────────────────
+    # "Sentinel-2 MSI": {
+    #     "display_name": "Sentinel-2 MSI",
+    #     "sensor_type":  "Sentinel-2 MSI",
+    #     "input_type":   "toa_refl",   # L1C product is BOA or TOA reflectance
+    #     "rad_scale":    "none",
+    #     "pixel_size_m": 10.0,
+    #     "vaa_source":   "manual",
+    #     "notes": "Sentinel-2 L1C TOA reflectance. No radiance scaling needed.",
+    # },
+    # "Generic radiance sensor": {
+    #     "display_name": "Generic radiance sensor",
+    #     "sensor_type":  "Unknown",
+    #     "input_type":   "radiance",
+    #     "rad_scale":    "uniform:1",   # already in W/m2/sr/um
+    #     "pixel_size_m": 30.0,
+    #     "vaa_source":   "manual",
+    #     "notes": "Generic sensor: image in W/m2/sr/um, enter all geometry manually.",
+    # },
+}
+DEFAULT_PROFILE = "EO-1 Hyperion"
+
+
+def build_rad_scale(profile_rad_scale, n_bands):
+    """
+    Build a numpy array of per-band radiance scale factors from a
+    profile rad_scale string.  Returns array of shape (n_bands,).
+    """
+    spec = profile_rad_scale
+    if spec == "none" or spec.startswith("uniform:1"):
+        return np.ones(n_bands, dtype=np.float32)
+    if spec.startswith("uniform:"):
+        val = float(spec.split(":")[1])
+        return np.full(n_bands, val, dtype=np.float32)
+    if spec.startswith("split:"):
+        _, vnir_s, swir_s, bnd_s = spec.split(":")
+        vnir_scale = float(vnir_s)
+        swir_scale = float(swir_s)
+        boundary   = int(bnd_s)          # 1-based last VNIR band
+        arr = np.full(n_bands, swir_scale, dtype=np.float32)
+        arr[:boundary] = vnir_scale      # bands 0..boundary-1 (0-based)
+        return arr
+    raise ValueError(f"Unknown rad_scale spec: '{spec}'")
 
 
 # =============================================================================
@@ -217,7 +296,9 @@ def read_mtl(mtl_path):
         acq_date=acq_date, start_time=start_time.strip(),
         month=dt.month, day=dt.day,
         sza=sza, saa=saa, vza=vza, vaa=round(vaa, 1),
+        # Legacy fields kept for backward compat; new code uses rad_scale_spec
         scale_vnir=scale_vnir, scale_swir=scale_swir,
+        rad_scale_spec=f"split:{scale_vnir}:{scale_swir}:70",
     )
 
 
@@ -339,9 +420,15 @@ def correct_hyperion(params, log=print):
         wl_nm, wl_um, fwhm_nm, bbl, envi_meta
 
     Acquisition geometry (from MTL or supplied directly):
-        acq_date, start_time, month, day
+        acq_date, start_time, month, day   (acq_date/start_time may be "")
         sza, saa, vza, vaa  [degrees]
-        scale_vnir, scale_swir  [DN-to-radiance divisors]
+
+    Sensor / calibration:
+        sensor_name   : str — written to output header "sensor type" field
+        input_type    : "radiance"  — apply DN→L→rho_toa chain
+                        "toa_refl" — data already is TOA reflectance; skip E0
+        rad_scale_spec: str — profile rad_scale string, passed to build_rad_scale()
+                        e.g. "split:40:80:70"  or  "uniform:1"  or  "none"
 
     Atmospheric correction parameters:
         idatm         [0-8]
@@ -369,8 +456,13 @@ def correct_hyperion(params, log=print):
     month, day    = params["month"], params["day"]
     sza, saa      = params["sza"], params["saa"]
     vza, vaa      = params["vza"], params["vaa"]
-    scale_vnir    = params["scale_vnir"]
-    scale_swir    = params["scale_swir"]
+    sensor_name    = params.get("sensor_name",    "Unknown sensor")
+    input_type     = params.get("input_type",     "radiance")
+    rad_scale_spec = params.get("rad_scale_spec", "uniform:1")
+    # Legacy support: if old scale_vnir/scale_swir keys present, convert
+    if "scale_vnir" in params and "rad_scale_spec" not in params:
+        sv = params["scale_vnir"]; ss = params["scale_swir"]
+        rad_scale_spec = f"split:{sv}:{ss}:70"
     n_lines       = params["n_lines"]
     n_samples     = params["n_samples"]
     n_bands       = params["n_bands"]
@@ -410,8 +502,9 @@ def correct_hyperion(params, log=print):
     log(f"  VZA            : {vza:.3f} deg")
     log(f"  VAA            : {vaa:.3f} deg")
     log(f"  cos(SZA)       : {cos_sza:.4f}")
-    log(f"  Scale VNIR     : {scale_vnir:.0f}  (DN / {scale_vnir:.0f} -> W/m2/sr/um)")
-    log(f"  Scale SWIR     : {scale_swir:.0f}  (DN / {scale_swir:.0f} -> W/m2/sr/um)")
+    log(f"  Sensor         : {sensor_name}")
+    log(f"  Input type     : {input_type}")
+    log(f"  Radiance scale : {rad_scale_spec}")
     log(f"  Atm model      : idatm = {idatm}")
     if idatm == 8:
         log(f"    H2O          : {uh2o:.4f} g/cm2")
@@ -527,7 +620,7 @@ def correct_hyperion(params, log=print):
         f"Atm: {atm_desc} iaer={iaer} AOT550={aot550}. "
         f"Env: {env_label}"
         + (f" r={env_radius_km:.1f}km" if env_model is not None else "") + ". "
-        + f"Scale VNIR/{int(scale_vnir)} SWIR/{int(scale_swir)}. "
+        + f"Input: {input_type}  Scale: {rad_scale_spec}. "
         f"Nodata=-9999. Processed {now_str}."
     )
 
@@ -568,7 +661,7 @@ def correct_hyperion(params, log=print):
     out_meta["samples"]           = str(n_samples)
     out_meta["bands"]             = str(out_n_bands)
     out_meta["description"]       = "{ " + description + " }"
-    out_meta["sensor type"]       = "EO-1 Hyperion"
+    out_meta["sensor type"]       = sensor_name
     out_meta["data type"]         = "2"        # int16
     out_meta["data ignore value"] = "-9999"
     out_meta["band names"]        = band_names_out
@@ -605,10 +698,8 @@ def correct_hyperion(params, log=print):
     log(f"  {hdr_file}")
     log(f"  shape={in_mm.shape}  dtype={in_mm.dtype}")
 
-    rad_scale = np.where(
-        np.arange(1, n_bands + 1) <= VNIR_SWIR_BOUNDARY,
-        scale_vnir, scale_swir
-    )
+    # Build per-band radiance scale from the sensor profile spec
+    rad_scale = build_rad_scale(rad_scale_spec, n_bands)
 
     # -- Build valid-pixel mask (lines x samples, bool) -----------------------
     if mask_file and os.path.isfile(mask_file):
@@ -640,22 +731,25 @@ def correct_hyperion(params, log=print):
 
     # -- Apply correction band by band, writing directly to output memmap ------
     log(f"Applying correction to {out_n_bands} bands...")
-    _w = 40;  _d = 0
-    log("[" + " " * _w + "]", end="\r")
+    _pct1 = -1
     for out_b, b in enumerate(good_idx):
-        _n = int((out_b + 1) / out_n_bands * _w)
-        if _n > _d:
-            _d = _n
-            log(f"[{chr(35)*_d}{chr(32)*(_w-_d)}] {int((out_b+1)/out_n_bands*100):3d}%  band {b+1}", end="\r")
-        if E0_um[b] < 1e-6:
-            continue
-
+        pct1 = int((out_b + 1) / out_n_bands * 100)
+        if pct1 // 10 > _pct1 // 10:
+            _pct1 = pct1
+            log(f"  {pct1:3d}%  (band {b+1})")
         # spectral memmap: (lines, samples, bands) — band is last
-        L = in_mm[:, :, b].astype(np.float32) / rad_scale[b]  # W/m2/sr/um
+        raw = in_mm[:, :, b].astype(np.float32)
 
-        # TOA reflectance: rho_toa = pi * L / (E0 * cos_sza)
-        # L in W/m2/sr/um, E0 (solirr) in W/m2/um -> consistent units, no conversion.
-        rho_toa = (np.pi * L) / (E0_um[b] * cos_sza)
+        if input_type == "toa_refl":
+            # Data already stores TOA reflectance (e.g. Sentinel-2 L1C)
+            rho_toa = raw / rad_scale[b]   # rad_scale = 1 or a scale factor
+        else:
+            # Radiance path: DN -> L [W/m2/sr/um] -> rho_toa
+            # L and E0 are in the same units so no conversion is needed.
+            L = raw / rad_scale[b]
+            if E0_um[b] < 1e-6:
+                continue
+            rho_toa = (np.pi * L) / (E0_um[b] * cos_sza)
         rho_toa = np.clip(rho_toa, 0.0, 1.5)
 
         # Surface reflectance: rho_s = (rho_toa - xa) / (xb*rho_toa + xc)
@@ -749,13 +843,12 @@ def correct_hyperion(params, log=print):
         s1_mm  = s1_obj.open_memmap(writable=False)
 
         log(f"  Smoothing and correcting {out_n_bands} bands...")
-        _w2 = 40;  _d2 = 0
-        log("  [" + " " * _w2 + "]", end="\r")
+        _pct2 = -1
         for out_b, b in enumerate(good_idx):
-            _n2 = int((out_b + 1) / out_n_bands * _w2)
-            if _n2 > _d2:
-                _d2 = _n2
-                log(f"  [{'#'*_d2}{chr(32)*(_w2-_d2)}] {int((out_b+1)/out_n_bands*100):3d}%  band {b+1}", end="\r")
+            pct2 = int((out_b + 1) / out_n_bands * 100)
+            if pct2 // 10 > _pct2 // 10:
+                _pct2 = pct2
+                log(f"    {pct2:3d}%  (band {b+1})")
             if T_down_arr[b] < 1e-4:
                 continue
 
@@ -813,7 +906,7 @@ def correct_hyperion(params, log=print):
             band_out[~valid] = -9999
             adj2_mm[:, :, out_b] = band_out
 
-        log(f"  [{'#'*_w2}] 100%  done          ")
+        log("    100%  done.")
         adj2_mm.flush()
         del adj2_mm, s1_mm
 
@@ -830,7 +923,7 @@ def correct_hyperion(params, log=print):
 
     del in_mm
 
-    log(f"[{'#'*_w}] 100%  done          ")
+    log("  100%  done.")
     log(f"\nOutput written: {out_hdr}")
     log(f"\nDescription:\n  {description}")
     return out_hdr
@@ -953,8 +1046,8 @@ def run_gui():
             _set("vaa",        round(m["vaa"], 3))
             _set("month",      m["month"])
             _set("day",        m["day"])
-            _set("scale_vnir", m["scale_vnir"])
-            _set("scale_swir", m["scale_swir"])
+            # Update rad_scale_spec if profile still matches Hyperion defaults
+            _set("rad_scale_spec", m["rad_scale_spec"])
             set_status(
                 f"MTL loaded: {m['acq_date']}  "
                 f"SZA={m['sza']:.2f}  VZA={m['vza']:.2f}")
@@ -1081,15 +1174,51 @@ def run_gui():
         ttk.Label(gg, text=lbl).grid(row=r, column=0, sticky=tk.W, pady=1)
         _entry(gg, key, default, width=12, row=r, column=1, sticky=tk.W, padx=6)
 
-    # Radiance scaling frame
-    sg = ttk.LabelFrame(tab1, text="Radiance scaling  (auto-filled from MTL)", padding=6)
-    sg.pack(fill=tk.X, pady=(0,0))
-    for r, (lbl, key, default) in enumerate([
-        ("Scale VNIR (divide DN by):", "scale_vnir", 40.0),
-        ("Scale SWIR (divide DN by):", "scale_swir", 80.0),
-    ]):
-        ttk.Label(sg, text=lbl).grid(row=r, column=0, sticky=tk.W, pady=2)
-        _entry(sg, key, default, width=12, row=r, column=1, sticky=tk.W, padx=6)
+    # Sensor profile selector + per-sensor fields
+    sg = ttk.LabelFrame(tab1, text="Sensor", padding=6)
+    sg.pack(fill=tk.X, pady=(0, 6))
+    sg.columnconfigure(1, weight=1)
+
+    ttk.Label(sg, text="Sensor profile:").grid(row=0, column=0, sticky=tk.W, pady=2)
+    profile_cb = _combo(sg, "sensor_profile",
+                        list(SENSOR_PROFILES.keys()), DEFAULT_PROFILE,
+                        width=28, row=0, column=1, sticky=tk.W, padx=6)
+    ttk.Label(sg, text="(adding sensors requires modifying SENSOR_PROFILES in the code)",
+              foreground="gray").grid(row=0, column=2, sticky=tk.W)
+
+    ttk.Label(sg, text="Sensor name (in header):").grid(row=1, column=0, sticky=tk.W, pady=2)
+    _entry(sg, "sensor_name", SENSOR_PROFILES[DEFAULT_PROFILE]["sensor_type"],
+           width=28, row=1, column=1, sticky=tk.W, padx=6)
+
+    ttk.Label(sg, text="Input type:").grid(row=2, column=0, sticky=tk.W, pady=2)
+    _combo(sg, "input_type",
+           ["radiance", "toa_refl"], "radiance",
+           width=14, row=2, column=1, sticky=tk.W, padx=6)
+    ttk.Label(sg, text="radiance: DN→L→ρ_toa→ρ_s   toa_refl: skip L and E0 steps",
+              foreground="gray").grid(row=2, column=2, sticky=tk.W)
+
+    ttk.Label(sg, text="Radiance scale:").grid(row=3, column=0, sticky=tk.W, pady=2)
+    _entry(sg, "rad_scale_spec",
+           SENSOR_PROFILES[DEFAULT_PROFILE]["rad_scale"],
+           width=20, row=3, column=1, sticky=tk.W, padx=6)
+    ttk.Label(sg, text='e.g. "split:40:80:70"  "uniform:1"  "none"',
+              foreground="gray").grid(row=3, column=2, sticky=tk.W)
+
+    def on_profile_change(*_):
+        """Fill sensor fields from the selected profile."""
+        name = _get("sensor_profile")
+        if name not in SENSOR_PROFILES:
+            return
+        p = SENSOR_PROFILES[name]
+        _set("sensor_name",    p["sensor_type"])
+        _set("input_type",     p["input_type"])
+        _set("rad_scale_spec", p["rad_scale"])
+        _set("pixel_size_m",   p["pixel_size_m"])
+        # VAA: if orbit_eo1, restore computed value; if manual, leave as-is
+        if p["vaa_source"] == "manual":
+            _set("vaa", 0.0)
+
+    profile_cb.bind("<<ComboboxSelected>>", on_profile_change)
 
     # ═══════════════════════════════════════════════
     # TAB 2 — Atmosphere
@@ -1229,8 +1358,9 @@ def run_gui():
             saa           = _get("saa",   float),
             vza           = _get("vza",   float),
             vaa           = _get("vaa",   float),
-            scale_vnir    = _get("scale_vnir", float),
-            scale_swir    = _get("scale_swir", float),
+            sensor_name    = _get("sensor_name"),
+            input_type     = _get("input_type"),
+            rad_scale_spec = _get("rad_scale_spec"),
             idatm         = ATM_MODELS.get(_get("idatm_name"), 2),
             uh2o          = _get("uh2o",          float),
             uo3           = _get("uo3",            float),
@@ -1254,16 +1384,8 @@ def run_gui():
         )
 
         def log(msg, end="\n"):
-            """Append to log.  end="\\r" overwrites the last line (progress bar)."""
-            if end == "\r":
-                idx = log_text.search("\n", "end-2c", backwards=True, stopindex="1.0")
-                if idx:
-                    log_text.delete(idx + "+1c", tk.END)
-                else:
-                    log_text.delete("1.0", tk.END)
-                log_text.insert(tk.END, msg)
-            else:
-                log_text.insert(tk.END, msg + end)
+            # end= is ignored in the GUI — always appends a new line.
+            log_text.insert(tk.END, msg + "\n")
             log_text.see(tk.END)
             root.update()
 
@@ -1300,7 +1422,9 @@ if __name__ == "__main__":
             acq_date="unknown", start_time="",
             month=7, day=3,
             sza=43.7, saa=139.1, vza=18.6, vaa=0.0,
-            scale_vnir=40.0, scale_swir=80.0,
+            sensor_name="EO-1 Hyperion",
+        input_type="radiance",
+        rad_scale_spec="split:40:80:70",
             n_lines=0, n_samples=0,
         )
         hdr_data = read_hdr(hdr_path)
