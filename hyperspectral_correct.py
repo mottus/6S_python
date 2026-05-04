@@ -535,6 +535,7 @@ def correct_hyperion(params, log=print):
     pixel_size_m   = params.get("pixel_size_m",   30.0)  # Hyperion GSD = 30 m
     env_radius_km  = params.get("env_radius_km",  2.0)
     config_file    = params.get("config_file",    None)
+    spec_csv_file  = params.get("spec_csv_file",  None)
     interleave     = params.get("interleave",     "bip").lower().strip()
     drop_bad_bands = params.get("drop_bad_bands", True)
     mask_file      = params.get("mask_file",      None)
@@ -571,6 +572,7 @@ def correct_hyperion(params, log=print):
         (f"  radius={env_radius_km:.1f} km" if env_model is not None else ""))
     log(f"  Mask file      : {mask_file if mask_file else '(auto: all-zero pixels)'}")
     log(f"  6S config out  : {config_file if config_file else '(not saved)'}")
+    log(f"  Spectral CSV   : {spec_csv_file if spec_csv_file else '(not saved)'}")
     log(f"  Output interleave: {interleave.upper()}")
     log(f"  Drop bad bands : {'yes' if drop_bad_bands else 'no'}")
     if do_adj2:
@@ -627,6 +629,14 @@ def correct_hyperion(params, log=print):
             cfg_fh.write(template_inp)
         log(f"  6S template config written to {config_file}")
 
+    # ── Collect spectral irradiance outputs for CSV ─────────────────────────
+    # The CSV is written after the 6S loop completes (first iteration only).
+    # Columns: wavelength_nm, atm_radiance, env_radiance,
+    #          ground_direct_irr, ground_diffuse_irr, ground_env_irr.
+    # All irradiance values are in W m⁻² µm⁻¹ (band-integrated).
+    # atm_radiance and env_radiance are at the sensor (TOA), W m⁻² sr⁻¹ µm⁻¹.
+    _spec_rows = []   # filled during the 6S loop below
+
     log(f"\nRunning 6S for {bbl.sum()} good bands...")
     n_ok = 0
     for b in range(n_bands):
@@ -644,6 +654,14 @@ def correct_hyperion(params, log=print):
         try:
             r = run6S(io.StringIO(inp), io.StringIO())
             xa[b], xb[b], xc[b], T_down_arr[b], T_up_arr[b], S_arr[b] = _coefficients(r)
+            _spec_rows.append((
+                wl_nm[b],
+                r.get("atm_radiance",      float("nan")),
+                r.get("env_radiance",      float("nan")),
+                r.get("ground_direct_irr", float("nan")),
+                r.get("ground_diffuse_irr",float("nan")),
+                r.get("ground_env_irr",    float("nan")),
+            ))
         except Exception as e:
             log(f"  Band {b+1} ({wl*1000:.1f} nm): 6S failed -- {e}")
             bbl[b] = 0
@@ -656,6 +674,23 @@ def correct_hyperion(params, log=print):
                 f"E0={E0_um[b]:.1f} W/m2/um")
 
     log(f"\n6S done: {n_ok} bands processed.")
+
+    if spec_csv_file and _spec_rows:
+        try:
+            with open(spec_csv_file, "w") as _csv_fh:
+                _csv_fh.write(
+                    "wavelength_nm,"
+                    "atm_radiance_W_m2_sr_um,"
+                    "env_radiance_W_m2_sr_um,"
+                    "ground_direct_irr_W_m2_um,"
+                    "ground_diffuse_irr_W_m2_um,"
+                    "ground_env_irr_W_m2_um\n"
+                )
+                for row in _spec_rows:
+                    _csv_fh.write(",".join(f"{v:.6g}" for v in row) + "\n")
+            log(f"  Spectral CSV written: {spec_csv_file} ({len(_spec_rows)} bands)")
+        except Exception as _e:
+            log(f"  WARNING: could not write spectral CSV: {_e}")
 
     # -- Build output header and create output file before computations --------
     # The output file is created now (allocating disk space) so we can
@@ -1185,6 +1220,26 @@ def run_gui():
     e["config_file"] = config_entry
     ttk.Button(fg, text="Browse...", command=browse_config).grid(row=5, column=2)
 
+    def browse_spec_csv():
+        p = filedialog.asksaveasfilename(
+            title="Save spectral irradiance CSV as",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("All", "*.*")])
+        if p:
+            spec_csv_entry.config(state=tk.NORMAL)
+            _set("spec_csv_file", p)
+
+    ttk.Label(fg, text="Save spectral CSV:").grid(row=6, column=0, sticky=tk.W, pady=3)
+    spec_csv_entry = ttk.Entry(fg)
+    spec_csv_entry.insert(0, "<not saved>")
+    spec_csv_entry.config(state=tk.DISABLED)
+    spec_csv_entry.grid(row=6, column=1, sticky=tk.EW, padx=4)
+    e["spec_csv_file"] = spec_csv_entry
+    ttk.Button(fg, text="Browse...", command=browse_spec_csv).grid(row=6, column=2)
+    ttk.Label(fg,
+              text="atm/env radiance + ground direct/diffuse/env irradiance, W m⁻² µm⁻¹",
+              foreground="gray").grid(row=7, column=0, columnspan=3, sticky=tk.W)
+
     # ── Checkboxes ──────────────────────────────────────────────────────────
     # All tk variable types (BooleanVar, IntVar) can show an indeterminate
     # visual state in Spyder because Spyder reuses the Tk root between runs,
@@ -1451,6 +1506,8 @@ def run_gui():
             mask_file     = mask_path,
             config_file   = (_get("config_file") or None)
                             if _get("config_file") not in ("", "<not saved>") else None,
+            spec_csv_file = (_get("spec_csv_file") or None)
+                            if _get("spec_csv_file") not in ("", "<not saved>") else None,
             interleave      = _get("interleave") or "bip",
             drop_bad_bands  = _drop[0],
             do_adj2         = _adj2[0],
