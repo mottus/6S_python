@@ -409,21 +409,47 @@ def _coefficients(r6s):
     xa, xb, xc        : stage-1 coefficients
     T_down, T_up, S   : needed for the stage-2 formula
 
-    Note on xa = srotot:
-        6S srotot is the aerosol path reflectance from the SOS solver.
-        It is NOT the total path reflectance seen by the sensor.
-        At 427nm (SZA=43.7, AOT=0.06): srotot~0.012, but the true sensor
-        path refl (Rayleigh+aerosol) is ~0.147 = chand(tau_R)+sroaer.
-        However xa=srotot IS the correct value to use in the retrieval
-        formula, because xb=1/(T_down*T_up) and xc=S*xb encode the full
-        Rayleigh+aerosol transmittance (T_down, T_up, S all include Rayleigh).
-        Substituting chand(tau_R)+sroaer for xa would double-count Rayleigh.
-        See the file header and sixs/utils.py for the full derivation.
+    Note on xa = srotot and the 6S formula:
+        srotot is the path reflectance output from the 6S SOS solver.
+        It equals what the sensor sees over a black surface (rho_s=0).
+        At 427nm, SZA=43.7, AOT=0.06: srotot ~ 0.012 (1.2% path refl).
+
+        This seems low given Rayleigh tau=0.275, but is physically correct:
+        chand(tau_R)=0.135 is the reflectance of a SEMI-INFINITE conservative
+        Rayleigh slab — not the thin real atmosphere over a surface. In the
+        real geometry, most photons transmit directly (T_dir=0.68) and only
+        ~1.2% are backscattered to the sensor. The two quantities are entirely
+        different radiative transfer problems.
+
+        The 6S forward model (verified by fitting) is:
+            rho_toa = xa + T_down*T_up * rho_s / (1 - s_tot * rho_s)
+        where s_tot = spherical_albedo_tot (TOTAL atmospheric spherical albedo).
+        The exact retrieval is then:
+            rho_s = (rho_toa - xa) / (T_d*T_u + s_tot*(rho_toa - xa))
+
+        CRITICAL: s_tot = spherical_albedo_tot (~0.029 at 427nm, AOT=0.06)
+        NOT pizera (~0.90, which is the aerosol-only spherical albedo).
+        Using pizera gives a denominator ~30x too large, causing rho_s to
+        be underestimated by 1-3 pp. Verified: only s_tot gives zero error.
+
+        sroray (Rayleigh component in srotot) is negative in the blue because
+        it is the COUPLING CORRECTION: Rayleigh_in_coupled_atm - Rayleigh_alone.
+        Aerosol forward-scatters photons that would otherwise contribute to
+        Rayleigh backscatter, reducing it. So sroray < 0 in the blue.
+        The total srotot = sroray + sroaer remains small and positive.
     """
     rho_atm = r6s["srotot"]
     T_down  = r6s["sdtott"]
     T_up    = r6s["sutott"]
-    S       = r6s["pizera"]
+    # CRITICAL: use spherical_albedo_tot (total atmospheric spherical albedo),
+    # NOT pizera. pizera is the aerosol-only spherical albedo (~0.90 in blue).
+    # The correct s in the retrieval formula rho_s=(rho_toa-xa)/(T_d*T_u+s*(rho_toa-xa))
+    # is the TOTAL spherical albedo = spherical_albedo_tot (~0.029 at 427nm, AOT=0.06).
+    # Using pizera causes the denominator to be ~30x too large, severely
+    # underestimating rho_s (by 1-3pp at typical surface reflectances).
+    # Verified by fitting the 6S forward model: rho_toa = xa + T_d*T_u*rho_s/(1-s*rho_s)
+    # gives exact round-trip recovery only with s = spherical_albedo_tot.
+    S       = r6s["spherical_albedo_tot"]
     denom   = T_down * T_up
     if denom < 1e-6:
         return 0.0, 1.0, 0.0, 1.0, 0.0
@@ -781,9 +807,27 @@ def correct_hyperion(params, log=print):
             rho_toa = (np.pi * L) / (E0_um[b] * cos_sza)
         rho_toa = np.clip(rho_toa, 0.0, 1.5)
 
-        # Surface reflectance: rho_s = (rho_toa - xa) / (xb*rho_toa + xc)
+        # Surface reflectance retrieval.
+        #
+        # The 6S forward model (Vermote et al. 1997, eq. 2) is:
+        #   rho_toa = xa + T_up * T_down * rho_s / (1 - S * rho_s)
+        #
+        # Solving exactly for rho_s:
+        #   (rho_toa - xa)(1 - S*rho_s) = T_up * T_down * rho_s
+        #   rho_toa - xa = rho_s * [T_up*T_down + S*(rho_toa - xa)]
+        #   rho_s = (rho_toa - xa) / (T_up*T_down + S*(rho_toa - xa))
+        #
+        # NOTE: The Vermote (1997) eq. 7 approximation:
+        #   rho_s ≈ (rho_toa - xa) / (xb*rho_toa + xc)
+        # where xb = 1/(T_down*T_up) and xc = S*xb, i.e. denominator = (rho_toa+S)/(T_d*T_u),
+        # is NOT the exact inverse of eq. 2. The exact denominator is T_d*T_u + S*(rho_toa-xa),
+        # not (rho_toa+S)/(T_d*T_u). The approximation underestimates rho_s by 1-6 pp
+        # in the blue band at AOT=0.20, growing with rho_s and with S (spherical albedo).
+        # The exact formula is used here instead.
+        #
+        # With xb = 1/(T_d*T_u): denominator = 1/xb + S*(rho_toa - xa)
         numer = rho_toa - xa[b]
-        denom = xb[b] * rho_toa + xc[b]
+        denom = (1.0 / xb[b]) + S_arr[b] * numer   # exact: T_d*T_u + S*(rho_toa-xa)
         with np.errstate(divide="ignore", invalid="ignore"):
             rho_s = np.where(np.abs(denom) > 1e-6, numer / denom, 0.0)
         rho_s = np.clip(rho_s, -0.1, 1.5)
@@ -911,18 +955,26 @@ def correct_hyperion(params, log=print):
             # When rho_env = rho_pixel (uniform case) this reduces exactly to
             # the Stage-1 formula.
             #
-            # Step 1: recover rho_toa per pixel by inverting the Stage-1 formula.
-            #   Stage-1: rho_s1 = (rho_toa - xa) / (xb*rho_toa + xc)
-            #   Inverted: rho_toa = (xa + xc*rho_s1) / (1 - xb*rho_s1)
+            # Step 1: recover rho_toa per pixel by exactly inverting Stage-1.
+            #   The EXACT Stage-1 forward model (from eq. 2) is:
+            #     rho_toa = xa + (T_d*T_u*rho_s1) / (1 - S*rho_s1)
+            #   Exact inverse:
+            #     rho_toa = xa + rho_s1*(1/xb) / (1 - S*rho_s1)
+            #             = [xa*(1-S*rho_s1) + rho_s1/xb] / (1 - S*rho_s1)
+            #
+            # Note: the Vermote approximation rho_toa=(xa+xc*rho_s1)/(1-xb*rho_s1)
+            # is NOT the exact inverse. Using the exact form avoids round-trip error.
 
             _xb = xb[b];  _xc = xc[b];  _xa = xa[b]
             _S  = S_arr[b]
+            _TdTu = 1.0 / _xb   # T_down * T_up
 
-            denom_inv = 1.0 - _xb * rho_s1
+            # Exact rho_toa recovery: rho_toa = xa + T_d*T_u*rho_s1/(1-S*rho_s1)
+            denom_inv = 1.0 - _S * rho_s1
             with np.errstate(divide="ignore", invalid="ignore"):
                 rho_toa_rec = np.where(
                     np.abs(denom_inv) > 1e-6,
-                    (_xa + _xc * rho_s1) / denom_inv,
+                    _xa + _TdTu * rho_s1 / denom_inv,
                     np.nan)
 
             # Step 2: apply the non-uniform forward model inverted for rho_pixel

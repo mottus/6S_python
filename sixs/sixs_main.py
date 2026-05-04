@@ -102,21 +102,28 @@ def run6S(input_stream=None, output_stream=None):
     dict : computed results including apparent reflectance, direct/diffuse
            irradiance and all integrated quantities.
     """
+    _opened = False
     if input_stream is None:
         input_stream = sys.stdin
+    elif isinstance(input_stream, str):
+        input_stream = open(input_stream)
+        _opened = True
     if output_stream is None:
         output_stream = sys.stdout
 
     def read(*args):
-        """Read next line and return parsed values.
-        Supports inline comments in (, !, or c styles as used in 6S input files."""
+        """Read next non-blank, non-comment line and return parsed values.
+        Strips full-line and inline comments: '#' (highest priority),
+        then '(' and '!' (6S legacy comment styles)."""
         while True:
             line = input_stream.readline()
             if not line:
                 raise EOFError("Unexpected end of input")
-            # Strip inline comments: everything from '(' or '!' onward
-            for marker in ('(', '!'):
-                line = line.split(marker)[0]
+            # Strip comments using find() so '#' in a value is not mis-parsed
+            for marker in ('#', '(', '!'):
+                idx = line.find(marker)
+                if idx >= 0:
+                    line = line[:idx]
             vals = line.split()
             if vals:  # skip blank/comment-only lines
                 break
@@ -909,17 +916,20 @@ def run6S(input_stream=None, output_stream=None):
     print(f"{m_kuu:4d} {m_paev:4d} {m_korgus:8.3f} {m_h2o:8.4f} {m_o:8.4f} {m_aot:8.4f} "
           f"{m_dir:12.4e} {m_dif:12.4e} {seb:12.4e}", file=output_stream)
 
-    # -----------------------------------------------------------------------
-    # 14. Return results dict
+    if _opened:
+        input_stream.close()
+
     # -----------------------------------------------------------------------
     return {
-        # Estonian custom outputs
-        'm_paev':   m_paev,     'm_kuu':    m_kuu,
-        'm_korgus': m_korgus,   'm_h2o':    m_h2o,
-        'm_o':      m_o,        'm_aot':    m_aot,
-        'm_dir':    m_dir,      'm_dif':    m_dif,
-        'spec_wl':  spec_wl,    'spec_dir': spec_dir,  'spec_dif': spec_dif,
-        'm_seb':    m_seb,      'm_sb':     m_sb,
+        # Input metadata (m_* variable names are Estonian legacy from main.f)
+        'day':      m_paev,   'month':   m_kuu,
+        'sza':      m_korgus, 'h2o':     m_h2o,
+        'o3':       m_o,      'aot550':  m_aot,
+        # Per-wavelength spectral irradiance arrays
+        'spec_wl':  spec_wl,  'spec_dir': spec_dir, 'spec_dif': spec_dif,
+        # Band-integrated direct and diffuse irradiance (W m⁻² µm⁻¹)
+        # = filter-weighted integrals of spec_dir and spec_dif
+        'direct_irr':  m_dir, 'diffuse_irr': m_dif,
         # Geometry
         'asol': asol, 'phi0': phi0, 'avis': avis, 'phiv': phiv,
         'xmus': xmus, 'xmuv': xmuv, 'xmud': xmud,
@@ -956,6 +966,8 @@ def run6S(input_stream=None, output_stream=None):
         'target_radiance_wm2': ainr[1][2],
         # Surface reflectance
         'rog': rog,
+        # pizera = aerosol single-scatter albedo (omega_0), NOT spherical albedo.
+        # Use spherical_albedo_tot ('sast') as 's' in the retrieval formula.
         'pizera': pizera,
     }
 

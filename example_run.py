@@ -1,65 +1,17 @@
 """
 example_run.py
 --------------
-Example script for running the 6S radiative transfer model.
-Place this file in the same folder as setup.py, then install the package:
+Examples for running the 6S radiative transfer model via the Python API.
 
+Install the package first:
     pip install -e .
-
-or run directly without installing (the sixs/ folder must be here):
-
+or run directly (the sixs/ folder must be present):
     python example_run.py
 """
 
 import io
 from sixs.sixs_main import run6S
 
-# simplest way to run on existing file
-fn = "data0"
-with open(fn) as f:
-    results = run6S(f)
-    # results = run6S(f, io.StringIO())   # redirect stdout to /dev/null
-
-# results['m_kuu']        # month
-# results['m_paev']       # day
-# results['m_korgus']     # solar zenith angle (°)
-# results['m_h2o']        # water vapour column (g/cm²)
-# results['m_o']          # ozone column (cm-atm)
-# results['m_aot']        # aerosol optical depth at 550 nm
-# results['m_dir']        # direct ground irradiance, band-integrated (W/m²/µm × µm)
-# results['m_dif']        # diffuse + env ground irradiance, same units
-# results['m_sb']         # band weight (sum of filter × Δλ)
-# results['m_seb']        # solar-weighted band integral
-# results['apparent_reflectance']   # what the sensor sees (rapp)
-# results['rog']          # retrieved or input surface reflectance
-# results['pizera']       # surface spherical albedo
-# results['srotot']       # total path reflectance
-# results['sroray']       # Rayleigh component
-# results['sroaer']       # aerosol component
-# results['sodaer']       # aerosol optical depth (at band centre)
-# results['sodray']       # Rayleigh optical depth
-# results['sodtot']       # total optical depth
-# results['sdtotr']       # downward Rayleigh transmittance
-# results['sdtota']       # downward aerosol transmittance
-# results['sdtott']       # total downward transmittance
-# results['sutotr']       # upward Rayleigh transmittance
-# results['sutota']       # upward aerosol transmittance
-# results['sutott']       # total upward transmittance
-# results['ground_direct_irr']    # direct beam (W/m²/µm)
-# results['ground_diffuse_irr']   # sky diffuse (W/m²/µm)
-# results['ground_env_irr']       # surface-reflected back down (W/m²/µm)
-# results['ground_direct_fraction']
-# results['ground_diffuse_fraction']
-# results['ground_env_fraction']
-# results['atm_radiance']         # path radiance (normalised)
-# results['env_radiance']         # environmental radiance (normalised)
-# results['target_radiance']      # target radiance (normalised)
-# results['atm_radiance_wm2']     # path radiance (absolute, W/m²/sr/µm)
-# results['env_radiance_wm2']     # environmental radiance (absolute, W/m²/sr/µm)
-# results['target_radiance_wm2']  # target radiance (absolute, W/m²/sr/µm)
-# results['spec_wl']   # list of wavelengths (µm) — one per spectral step
-# results['spec_dir']  # direct beam irradiance at each wavelength (W/m²/µm)
-# results['spec_dif']  # diffuse + environmental irradiance (W/m²/µm)
 
 # ---------------------------------------------------------------------------
 # Example 1 — Simple satellite observation, Lambertian sand surface
@@ -67,10 +19,10 @@ with open(fn) as f:
 
 input_text_1 = """
 0                          ! igeom: user-defined geometry
-30.0 0.0 0.0 180.0 7 1    ! asol phi0 avis phiv month day
+30.0 0.0 0.0 180.0 7 1    ! SZA SAA VZA VAA month day
 2                          ! idatm: mid-latitude summer atmosphere
-1                          ! iaer:  continental aerosol
-23.0                       ! visibility = 23 km
+1                          ! iaer:  continental aerosol model
+23.0                       ! visibility [km]
 0.0                        ! xps:  target at sea level
 -1000                      ! xpp:  satellite sensor
 5                          ! iwave: AVHRR NOAA-6 band 1 (0.55-0.75 µm)
@@ -85,15 +37,24 @@ print("Example 1: continental aerosol, sand surface, AVHRR band 1")
 print("=" * 60)
 r1 = run6S(io.StringIO(input_text_1))
 
-print(f"  Apparent reflectance : {r1['apparent_reflectance']:.4f}")
-print(f"  Atmospheric path refl: {r1['srotot']:.4f}")
-print(f"  Rayleigh reflectance : {r1['sroray']:.4f}")
-print(f"  Aerosol reflectance  : {r1['sroaer']:.4f}")
-print(f"  AOT at 550 nm        : {r1['m_aot']:.4f}")
-print(f"  Direct irradiance    : {r1['m_dir']:.2e} W/m²/µm")
-print(f"  Diffuse irradiance   : {r1['m_dif']:.2e} W/m²/µm")
-print(f"  Down transmittance   : {r1['sdtott']:.4f}")
-print(f"  Up transmittance     : {r1['sutott']:.4f}")
+print(f"  Apparent reflectance       : {r1['apparent_reflectance']:.4f}")
+print(f"  Path reflectance (srotot)  : {r1['srotot']:.4f}")
+print(f"    Rayleigh–aerosol coupling: {r1['sroray']:.4f}  (see note below)")
+print(f"    Aerosol contribution     : {r1['sroaer']:.4f}")
+print(f"  AOT at 550 nm              : {r1['aot550']:.4f}")
+print(f"  Direct surface irradiance  : {r1['direct_irr']:.2e} W/m²/µm")
+print(f"  Diffuse surface irradiance : {r1['diffuse_irr']:.2e} W/m²/µm")
+print(f"  Down transmittance (total) : {r1['sdtott']:.4f}")
+print(f"  Up transmittance (total)   : {r1['sutott']:.4f}")
+print(f"  Spherical albedo (total)   : {r1['spherical_albedo_tot']:.4f}  <- use as 's' in retrieval")
+print(f"  pizera (aerosol SSA ω₀)   : {r1['pizera']:.4f}  <- NOT spherical albedo")
+print()
+print("  Note on sroray: in the 6S SOS decomposition, sroray is the")
+print("  Rayleigh–aerosol coupling correction, not the Rayleigh path")
+print("  reflectance itself. It can be negative in the blue because aerosol")
+print("  forward-scattering reduces the Rayleigh backscatter contribution.")
+print("  The total path refl. seen by the sensor = chand(tau_R) + sroaer.")
+print("  srotot (= sroray + sroaer) is correct as xa in the retrieval formula.")
 print()
 
 
@@ -113,7 +74,7 @@ input_text_2 = """
 0
 0
 3
--0.18                      ! rapp < 0: retrieve surface refl from apparent refl 0.18
+-0.18      ! rapp < 0: retrieve surface refl from apparent reflectance 0.18
 """
 
 print("=" * 60)
@@ -121,8 +82,8 @@ print("Example 2: atmospheric correction (retrieve surface refl.)")
 print("=" * 60)
 r2 = run6S(io.StringIO(input_text_2))
 
-print(f"  Input apparent refl  : 0.18")
-print(f"  Retrieved surface refl: {r2['rog']:.4f}")
+print(f"  Input apparent reflectance  : 0.18")
+print(f"  Retrieved surface refl (rog): {r2['rog']:.4f}")
 print()
 
 
@@ -152,20 +113,20 @@ print("Example 3: Kuusk canopy BRDF, TM4 NIR")
 print("=" * 60)
 r3 = run6S(io.StringIO(input_text_3))
 
-print(f"  Apparent reflectance : {r3['apparent_reflectance']:.4f}")
-print(f"  Ground direct irr.   : {r3['ground_direct_irr']:.1f} W/m²/µm")
-print(f"  Ground diffuse irr.  : {r3['ground_diffuse_irr']:.1f} W/m²/µm")
+print(f"  Apparent reflectance        : {r3['apparent_reflectance']:.4f}")
+print(f"  Direct surface irradiance   : {r3['ground_direct_irr']:.1f} W/m²/µm")
+print(f"  Diffuse surface irradiance  : {r3['ground_diffuse_irr']:.1f} W/m²/µm")
 print()
 
 
 # ---------------------------------------------------------------------------
-# Example 4 — Multiple geometries in a loop
+# Example 4 — Apparent reflectance vs solar zenith angle
 # ---------------------------------------------------------------------------
 
 print("=" * 60)
 print("Example 4: apparent reflectance vs solar zenith angle")
 print("=" * 60)
-print(f"  {'SZA':>6}  {'rapp':>8}  {'direct_irr':>12}")
+print(f"  {'SZA':>6}  {'rapp':>8}  {'direct_irr':>14}  {'diffuse_irr':>14}")
 
 for sza in [10, 20, 30, 40, 50, 60, 70]:
     inp = f"""
@@ -183,23 +144,22 @@ for sza in [10, 20, 30, 40, 50, 60, 70]:
 -2.0
 """
     r = run6S(io.StringIO(inp))
-    print(f"  {sza:>6}°  {r['apparent_reflectance']:>8.4f}  {r['m_dir']:>12.2e}")
+    print(f"  {sza:>5}°  {r['apparent_reflectance']:>8.4f}"
+          f"  {r['direct_irr']:>14.2e}  {r['diffuse_irr']:>14.2e}")
 
 
 # ---------------------------------------------------------------------------
 # Example 5 — Run from a configuration file (data0)
 #
-# data0 describes an aircraft measurement scenario:
+# data0: aircraft measurement scenario
 #   Geometry  : SZA=40°, SAA=100°, view zenith=45°, view azimuth=50°, July 23
-#   Atmosphere : user H2O=3.0 g/cm², O3=0.35 cm-atm (US62 profile shape)
-#   Aerosol   : equal-mix custom (25% each of dust, water-sol, oceanic, soot)
+#   Atmosphere : user H₂O=3.0 g/cm², O₃=0.35 cm-atm (US62 profile shape)
+#   Aerosol   : equal-mix custom (25% each: dust, water-sol, oceanic, soot)
 #               AOT @ 550 nm = 0.50
-#   Target    : 0.2 km altitude, non-uniform surface (circular target)
+#   Target    : 0.2 km altitude, non-uniform surface (circular)
 #               target=clear water, environment=vegetation, radius=0.5 km
 #   Sensor    : aircraft at 3.3 km above ground, AVHRR NOAA-9 band 1
-#               H2O=-1.5, O3=-0.35 (negative → interpolate from profile)
-#               AOT under plane = 0.25
-#   Output    : retrieve surface reflectance from apparent reflectance 0.10
+#   Output    : retrieve surface refl from apparent reflectance 0.10
 # ---------------------------------------------------------------------------
 
 print()
@@ -207,15 +167,15 @@ print("=" * 60)
 print("Example 5: run from configuration file  data0")
 print("=" * 60)
 
-with open("data0") as f:
-    r5 = run6S(f)
+# run6S accepts a file path directly
+r5 = run6S("data0")
 
-print(f"  Solar zenith angle   : {r5['m_korgus']:.1f}°")
-print(f"  Date                 : {r5['m_kuu']}/{r5['m_paev']}")
-print(f"  AOT at 550 nm        : {r5['m_aot']:.4f}")
-print(f"  Water vapour         : {r5['m_h2o']:.2f} g/cm²")
-print(f"  Ozone                : {r5['m_o']:.4f} cm-atm")
-print(f"  Apparent reflectance : {r5['apparent_reflectance']:.4f}")
-print(f"  Retrieved surface refl (rog): {r5['rog']:.4f}")
-print(f"  Direct irradiance    : {r5['m_dir']:.4e} W/m²/µm")
-print(f"  Diffuse irradiance   : {r5['m_dif']:.4e} W/m²/µm")
+print(f"  Solar zenith angle    : {r5['sza']:.1f}°")
+print(f"  Date                  : {r5['month']}/{r5['day']}")
+print(f"  AOT at 550 nm         : {r5['aot550']:.4f}")
+print(f"  Water vapour          : {r5['h2o']:.2f} g/cm²")
+print(f"  Ozone                 : {r5['o3']:.4f} cm-atm")
+print(f"  Apparent reflectance  : {r5['apparent_reflectance']:.4f}")
+print(f"  Retrieved surface refl: {r5['rog']:.4f}")
+print(f"  Direct surface irr.   : {r5['direct_irr']:.4e} W/m²/µm")
+print(f"  Diffuse surface irr.  : {r5['diffuse_irr']:.4e} W/m²/µm")
