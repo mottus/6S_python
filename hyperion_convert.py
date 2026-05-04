@@ -152,16 +152,32 @@ def convert_hyperion(params, log=print):
 
     params keys
     -----------
-    input_path  : str — .zip archive or folder containing band GeoTIFFs
-    out_base    : str — output base path (no extension)
-    interleave  : str — 'bsq', 'bil', or 'bip'
+    input_path     : str  — .zip archive or folder containing band GeoTIFFs
+    out_base       : str  — output base path (no extension)
+    interleave     : str  — 'bsq', 'bil', or 'bip'
+    output_type    : str  — 'radiance' (default) or 'toa_reflectance'.
+                     'radiance': store raw DN as int16, nodata=-9999.
+                     'toa_reflectance': convert to TOA reflectance
+                       rho = pi * L / (E0 * cos(SZA)), stored as
+                       round(rho * refl_scale) int16, nodata=-9999.
+                       Requires sza_deg, month, day.
+    refl_scale     : int  — reflectance storage scale (default 10000).
+                     Fractional rho = stored_integer / refl_scale.
+    sza_deg        : float — solar zenith angle in degrees.
+    month          : int  — month 1-12 (for Earth-Sun distance).
+    day            : int  — day of month.
     """
     import rasterio
     import spectral.io.envi as envi
 
-    input_path = params["input_path"]
-    out_base   = params["out_base"]
-    interleave = params["interleave"].lower().strip()
+    input_path  = params["input_path"]
+    out_base    = params["out_base"]
+    interleave  = params["interleave"].lower().strip()
+    output_type = params.get("output_type", "radiance").lower().strip()
+    refl_scale  = int(params.get("refl_scale", 10000))
+    sza_deg     = float(params.get("sza_deg", 0.0))
+    month       = int(params.get("month", 1))
+    day         = int(params.get("day",   1))
 
     # ── Unzip or use folder ───────────────────────────────────────────────────
     tmpdir = None
@@ -220,17 +236,76 @@ def convert_hyperion(params, log=print):
 
         log(f"Size: {n_lines} lines × {n_samples} samples × {n_found} bands")
 
+        # ── Per-band E0 for TOA reflectance conversion ─────────────────────────
+        # The 6S TSIS-1 solar spectrum is used (solirr, W/m2/um at 1 AU).
+        # Earth-Sun distance is corrected via varsol() (Spencer 1971).
+        # Radiance scaling: VNIR bands 1-70 = DN/40, SWIR 71-242 = DN/80.
+        E0_band      = None
+        rad_scale_arr= None
+        cos_sza      = 1.0
+        if output_type == "toa_reflectance":
+            try:
+                import sys as _sys
+                import importlib, pathlib
+                # Find sixs package — expected one level up from this file
+                _here = pathlib.Path(__file__).resolve().parent
+                for _candidate in [_here.parent, _here, _here.parent.parent]:
+                    _pkg = _candidate / "sixs_python"
+                    if _pkg.is_dir():
+                        _sys.path.insert(0, str(_pkg)); break
+                from sixs.utils import solirr, varsol
+            except ImportError:
+                # Try direct import (sixs already on sys.path)
+                try:
+                    from sixs.utils import solirr, varsol
+                except ImportError as _e:
+                    raise ImportError(
+                        "Cannot import sixs.utils — ensure sixs_python is on "
+                        "sys.path or installed. Cannot compute TOA reflectance."
+                    ) from _e
+            cos_sza = np.cos(np.radians(sza_deg))
+            if cos_sza < 0.01:
+                raise ValueError(
+                    f"SZA={sza_deg:.1f} deg: sun is below or near horizon, "
+                    "cannot compute TOA reflectance.")
+            dsol = varsol(day, month)   # Earth-Sun distance factor (1/R^2)
+            # E0 per band at actual Earth-Sun distance [W/m2/um]
+            E0_band = np.array(
+                [solirr(HYPERION_WL_NM[i] / 1000.0) * dsol
+                 for i in range(n_found)], dtype=np.float64)
+            # Radiance scale: 1-based band number <= 70 -> VNIR, else SWIR
+            rad_scale_arr = np.where(
+                np.arange(1, n_found + 1) <= 70, 40.0, 80.0)
+            log(f"  SZA={sza_deg:.2f} deg  cos(SZA)={cos_sza:.4f}  "
+                f"dsol={dsol:.5f}")
+            log(f"  Solar spectrum: TSIS-1 HSRS (Coddington et al. 2021)")
+            log(f"  Reflectance scale: x{refl_scale}  "
+                f"(stored_int / {refl_scale} = fractional rho)")
+
         # ── ENVI metadata ─────────────────────────────────────────────────────
         now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-        description = (
-            f"EO-1 Hyperion L1T radiance cube. "
-            f"Acquisition: {acq_date}  {start_t}. "
-            f"Converted to ENVI: {now_str}. "
-            f"Source: {os.path.basename(input_path)}. "
-            f"Bands: {n_found}. "
-            f"Radiance: DN/40=W/m2/sr/um (VNIR), DN/80=W/m2/sr/um (SWIR). "
-            f"Nodata=-9999 (all-zero pixels)."
-        )
+        if output_type == "toa_reflectance":
+            description = (
+                f"EO-1 Hyperion L1T TOA reflectance x{refl_scale}. "
+                f"Acquisition: {acq_date}  {start_t}. "
+                f"Converted: {now_str}. "
+                f"Source: {os.path.basename(input_path)}. "
+                f"Bands: {n_found}. SZA={sza_deg:.3f} deg. "
+                f"Solar spectrum: TSIS-1 HSRS (Coddington et al. 2021). "
+                f"L: VNIR=DN/40, SWIR=DN/80 W/m2/sr/um. "
+                f"rho=pi*L/(E0*cos(SZA)), stored=round(rho*{refl_scale}). "
+                f"Nodata=-9999."
+            )
+        else:
+            description = (
+                f"EO-1 Hyperion L1T radiance cube. "
+                f"Acquisition: {acq_date}  {start_t}. "
+                f"Converted to ENVI: {now_str}. "
+                f"Source: {os.path.basename(input_path)}. "
+                f"Bands: {n_found}. "
+                f"Radiance: DN/40=W/m2/sr/um (VNIR), DN/80=W/m2/sr/um (SWIR). "
+                f"Nodata=-9999 (all-zero pixels)."
+            )
 
         # UTM map info from rasterio geotransform and CRS.
         # ENVI map info format:
@@ -286,6 +361,7 @@ def convert_hyperion(params, log=print):
             "sensor type":       "EO-1 Hyperion",
             "byte order":        "0",
             "data ignore value": "-9999",
+            "reflectance scale": str(refl_scale) if output_type == "toa_reflectance" else None,
             "wavelength units":  "Nanometers",
             "wavelength":        [f"{v:.2f}" for v in HYPERION_WL_NM[:n_found]],
             "fwhm":              [f"{v:.4f}" for v in HYPERION_FWHM_NM[:n_found]],
@@ -302,6 +378,8 @@ def convert_hyperion(params, log=print):
                 "Output path is the same as the input — choose a different name.")
 
         # ── Create output ENVI file ───────────────────────────────────────────
+        # Remove any metadata fields set to None (conditional on output_type)
+        envi_meta = {k: v for k, v in envi_meta.items() if v is not None}
         out_hdr = out_base + ".hdr"
         log(f"\nCreating output: {out_hdr}")
         out_obj = envi.create_image(out_hdr, envi_meta,
@@ -312,15 +390,29 @@ def convert_hyperion(params, log=print):
         out_mm.flush()
         log(f"  {out_mm.nbytes/1e6:.1f} MB allocated  ({interleave.upper()})")
 
-        # ── Read bands and write ──────────────────────────────────────────────
-        log(f"Reading and writing {n_found} bands...")
+        # ── Read bands, convert if needed, and write ──────────────────────────
+        mode_str = "TOA reflectance" if output_type == "toa_reflectance" else "radiance"
+        log(f"Writing {n_found} bands ({mode_str})...")
         _pct_logged = -1
         for out_b, band_num in enumerate(bands_sorted):
-            with rasterio.open(band_files[band_num]) as src:
-                data = src.read(1)            # (lines, samples)
-            out_mm[:, :, out_b] = data.astype(np.int16)
+            with rasterio.open(band_files[band_num]) as src_r:
+                dn = src_r.read(1).astype(np.float32)  # (lines, samples)
+
+            if output_type == "toa_reflectance" and E0_band is not None:
+                # DN -> radiance [W/m2/sr/um]
+                L = dn / rad_scale_arr[out_b]
+                # Radiance -> TOA reflectance (dimensionless)
+                # Both L and E0 are in W/m2/um so the ratio is dimensionless.
+                E0 = E0_band[out_b]
+                rho = (np.pi * L) / (E0 * cos_sza) if E0 > 1e-6 else np.zeros_like(L)
+                rho = np.clip(rho, 0.0, 1.5)
+                band_data = np.clip(rho * refl_scale, -32768, 32767).astype(np.int16)
+            else:
+                # Radiance mode: store DN unchanged
+                band_data = dn.astype(np.int16)
+
+            out_mm[:, :, out_b] = band_data
             pct = int((out_b + 1) / n_found * 100)
-            # Log a progress line at each 10% milestone
             if pct // 10 > _pct_logged // 10:
                 _pct_logged = pct
                 log(f"  {pct:3d}%  (band {band_num}/{bands_sorted[-1]})")
@@ -462,6 +554,62 @@ def run_gui():
         e[key] = entry
         ttk.Button(fg, text="Browse...", command=cmd).grid(row=r, column=2)
 
+    # Output type and interleave
+    og = ttk.LabelFrame(tab1, text="Output options", padding=8)
+    og.pack(fill=tk.X, pady=(0, 6))
+
+    # Output type: radiance or TOA reflectance
+    ttk.Label(og, text="Output type:").grid(row=0, column=0, sticky=tk.W, pady=3)
+    type_cb = ttk.Combobox(og,
+                            values=["radiance", "toa_reflectance"],
+                            state="readonly", width=18)
+    type_cb.set("radiance")
+    type_cb.grid(row=0, column=1, sticky=tk.W, padx=6)
+    e["output_type"] = type_cb
+    ttk.Label(og,
+              text="radiance = raw DN  |  toa_reflectance = rho, needs SZA",
+              foreground="gray").grid(row=0, column=2, sticky=tk.W)
+
+    # SZA field — enabled only when toa_reflectance is selected
+    ttk.Label(og, text="SZA (deg):").grid(row=1, column=0, sticky=tk.W, pady=3)
+    sza_entry = ttk.Entry(og, width=10)
+    sza_entry.insert(0, "")
+    sza_entry.grid(row=1, column=1, sticky=tk.W, padx=6)
+    e["sza_deg"] = sza_entry
+    ttk.Label(og,
+              text="solar zenith angle — auto-filled from MTL if available",
+              foreground="gray").grid(row=1, column=2, sticky=tk.W)
+
+    ttk.Label(og, text="Month:").grid(row=2, column=0, sticky=tk.W, pady=3)
+    month_entry = ttk.Entry(og, width=6)
+    month_entry.insert(0, "")
+    month_entry.grid(row=2, column=1, sticky=tk.W, padx=6)
+    e["month"] = month_entry
+
+    ttk.Label(og, text="Day:").grid(row=3, column=0, sticky=tk.W, pady=3)
+    day_entry = ttk.Entry(og, width=6)
+    day_entry.insert(0, "")
+    day_entry.grid(row=3, column=1, sticky=tk.W, padx=6)
+    e["day"] = day_entry
+
+    ttk.Label(og, text="Refl. scale:").grid(row=4, column=0, sticky=tk.W, pady=3)
+    scale_entry = ttk.Entry(og, width=10)
+    scale_entry.insert(0, "10000")
+    scale_entry.grid(row=4, column=1, sticky=tk.W, padx=6)
+    e["refl_scale"] = scale_entry
+    ttk.Label(og, text="stored_int / scale = fractional reflectance",
+              foreground="gray").grid(row=4, column=2, sticky=tk.W)
+
+    def on_type_change(*_):
+        """Enable SZA/month/day only when toa_reflectance is selected."""
+        is_refl = type_cb.get() == "toa_reflectance"
+        state = tk.NORMAL if is_refl else tk.DISABLED
+        for w in (sza_entry, month_entry, day_entry):
+            w.config(state=state)
+
+    type_cb.bind("<<ComboboxSelected>>", on_type_change)
+    on_type_change()   # apply initial state
+
     # Interleave selector
     ig = ttk.LabelFrame(tab1, text="Output interleave", padding=8)
     ig.pack(fill=tk.X)
@@ -498,10 +646,16 @@ def run_gui():
             run_btn.config(state=tk.NORMAL)
             return
 
+        out_type = _get("output_type") or "radiance"
         params = {
-            "input_path": inp,
-            "out_base":   _get("out_base") or os.path.splitext(inp)[0]+"_ENVI",
-            "interleave": _get("interleave") or "bsq",
+            "input_path":  inp,
+            "out_base":    _get("out_base") or os.path.splitext(inp)[0]+"_ENVI",
+            "interleave":  _get("interleave") or "bsq",
+            "output_type": out_type,
+            "refl_scale":  int(_get("refl_scale") or 10000),
+            "sza_deg":     float(_get("sza_deg") or 0.0),
+            "month":       int(_get("month") or 1),
+            "day":         int(_get("day")   or 1),
         }
 
         def log(msg, end="\n"):
@@ -538,10 +692,14 @@ if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1:
         convert_hyperion({
-            "input_path": sys.argv[1],
-            "out_base":   sys.argv[2] if len(sys.argv)>2
-                          else os.path.splitext(sys.argv[1])[0]+"_ENVI",
-            "interleave": sys.argv[3] if len(sys.argv)>3 else "bsq",
+            "input_path":  sys.argv[1],
+            "out_base":    sys.argv[2] if len(sys.argv)>2
+                           else os.path.splitext(sys.argv[1])[0]+"_ENVI",
+            "interleave":  sys.argv[3] if len(sys.argv)>3 else "bsq",
+            "output_type": sys.argv[4] if len(sys.argv)>4 else "radiance",
+            "sza_deg":     float(sys.argv[5]) if len(sys.argv)>5 else 0.0,
+            "month":       int(sys.argv[6])   if len(sys.argv)>6 else 1,
+            "day":         int(sys.argv[7])   if len(sys.argv)>7 else 1,
         })
     else:
         run_gui()
