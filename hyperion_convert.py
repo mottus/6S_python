@@ -163,7 +163,10 @@ def convert_hyperion(params, log=print):
                        Requires sza_deg, month, day.
     refl_scale     : int  — reflectance storage scale (default 10000).
                      Fractional rho = stored_integer / refl_scale.
-    sza_deg        : float — solar zenith angle in degrees.
+    sza_deg        : float or None — solar zenith angle in degrees.
+                     None (default) means "not provided by user";
+                     the MTL value will be used if available.
+                     0.0 is a valid SZA (sun at zenith).
     month          : int  — month 1-12 (for Earth-Sun distance).
     day            : int  — day of month.
     """
@@ -175,7 +178,9 @@ def convert_hyperion(params, log=print):
     interleave  = params["interleave"].lower().strip()
     output_type = params.get("output_type", "radiance").lower().strip()
     refl_scale  = int(params.get("refl_scale", 10000))
-    sza_deg     = float(params.get("sza_deg", 0.0))
+    # Use None as sentinel so we can distinguish "not set" from a genuine SZA of 0
+    _sza_raw = params.get("sza_deg", None)
+    sza_deg  = float(_sza_raw) if _sza_raw is not None else None
     month       = int(params.get("month", 1))
     day         = int(params.get("day",   1))
 
@@ -195,18 +200,45 @@ def convert_hyperion(params, log=print):
 
     try:
         # ── Find MTL file ─────────────────────────────────────────────────────
-        mtl_candidates = glob.glob(
-            os.path.join(work_dir, "**", "*MTL*"), recursive=True)
-        mtl_candidates = [p for p in mtl_candidates
-                          if not p.endswith((".hdr", ".img"))]
+        # Search for MTL: case-insensitive ("MTL" or "mtl" in name or extension)
+        _skip_ext = {".hdr", ".img", ".tif", ".TIF", ".zip"}
+        _raw = (glob.glob(os.path.join(work_dir, "**", "*MTL*"), recursive=True) +
+                glob.glob(os.path.join(work_dir, "**", "*mtl*"), recursive=True))
+        mtl_candidates = sorted({
+            p for p in _raw
+            if os.path.isfile(p)
+            and os.path.splitext(p)[1] not in _skip_ext
+        })
         if not mtl_candidates:
-            raise FileNotFoundError("No MTL file found in archive.")
-        mtl_path = sorted(mtl_candidates)[0]
-        log(f"MTL: {os.path.basename(mtl_path)}")
+            # Graceful: continue without geometry (user must supply SZA manually)
+            log("WARNING: No MTL file found. Acquisition geometry is unknown. "
+                "Enter SZA manually if using toa_reflectance.")
+            mtl_path = None
+            mtl      = {}
+            acq_date = "unknown"
+            start_t  = ""
+        else:
+            mtl_path = mtl_candidates[0]
+            log(f"MTL: {os.path.basename(mtl_path)}")
+            mtl      = parse_mtl(mtl_path)
+            acq_date = mtl.get("ACQUISITION_DATE", "unknown")
+            start_t  = mtl.get("START_TIME", "").strip()
 
-        mtl      = parse_mtl(mtl_path)
-        acq_date = mtl.get("ACQUISITION_DATE", "unknown")
-        start_t  = mtl.get("START_TIME", "").strip()
+        # Extract sun geometry from MTL for TOA reflectance conversion
+        mtl_sza = mtl_month = mtl_day = None
+        if mtl:
+            try:
+                mtl_sza = round(90.0 - float(mtl["SUN_ELEVATION"]), 3)
+            except (KeyError, ValueError):
+                pass
+            try:
+                import datetime as _dt
+                _d = _dt.date.fromisoformat(acq_date)
+                mtl_month, mtl_day = _d.month, _d.day
+            except (ValueError, TypeError):
+                pass
+            if mtl_sza is not None:
+                log(f"  {acq_date}  SZA={mtl_sza:.3f} deg")
 
         # ── Find per-band GeoTIFFs ────────────────────────────────────────────
         tifs = sorted(
@@ -263,12 +295,24 @@ def convert_hyperion(params, log=print):
                         "Cannot import sixs.utils — ensure sixs_python is on "
                         "sys.path or installed. Cannot compute TOA reflectance."
                     ) from _e
-            cos_sza = np.cos(np.radians(sza_deg))
+            # Prefer geometry from MTL; fall back to user-supplied values.
+            # Priority: MTL > user-supplied > error
+            eff_sza   = mtl_sza   if mtl_sza   is not None else sza_deg
+            eff_month = mtl_month if mtl_month is not None else month
+            eff_day   = mtl_day   if mtl_day   is not None else day
+            if eff_sza is None:
+                raise ValueError(
+                    "SZA not available: no MTL found and no value entered manually.")
+            # Warn if user entered a value that differs from the MTL
+            if mtl_sza is not None and sza_deg is not None and abs(mtl_sza - sza_deg) > 0.5:
+                log(f"  Note: using SZA from MTL ({mtl_sza:.3f} deg); "
+                    f"manually entered value was {sza_deg:.1f} deg.")
+            sza_deg = eff_sza   # update for logging and header
+            cos_sza = np.cos(np.radians(eff_sza))
             if cos_sza < 0.01:
                 raise ValueError(
-                    f"SZA={sza_deg:.1f} deg: sun is below or near horizon, "
-                    "cannot compute TOA reflectance.")
-            dsol = varsol(day, month)   # Earth-Sun distance factor (1/R^2)
+                    f"SZA={eff_sza:.1f} deg: sun is below or near horizon.")
+            dsol = varsol(eff_day, eff_month)
             # E0 per band at actual Earth-Sun distance [W/m2/um]
             E0_band = np.array(
                 [solirr(HYPERION_WL_NM[i] / 1000.0) * dsol
@@ -466,11 +510,14 @@ def convert_hyperion(params, log=print):
 
         # ── Copy MTL ──────────────────────────────────────────────────────────
         out_dir  = os.path.dirname(os.path.abspath(out_base))
-        mtl_ext  = os.path.splitext(mtl_path)[1]
-        scene_id = os.path.splitext(os.path.basename(mtl_path))[0]
-        mtl_dest = os.path.join(out_dir, scene_id + "_MTL" + mtl_ext)
-        shutil.copy2(mtl_path, mtl_dest)
-        log(f"MTL copied: {os.path.basename(mtl_dest)}")
+        if mtl_path:
+            mtl_ext  = os.path.splitext(mtl_path)[1]
+            scene_id = os.path.splitext(os.path.basename(mtl_path))[0]
+            mtl_dest = os.path.join(out_dir, scene_id + "_MTL" + mtl_ext)
+            shutil.copy2(mtl_path, mtl_dest)
+            log(f"MTL copied: {os.path.basename(mtl_dest)}")
+        else:
+            log("  (No MTL file to copy.)")
 
         log(f"\nDone.")
         log(f"  Image : {out_hdr}")
@@ -526,6 +573,34 @@ def run_gui():
     fg.pack(fill=tk.X, pady=(0, 10))
     fg.columnconfigure(1, weight=1)
 
+    def _peek_mtl(zip_path):
+        """Read SZA/date from MTL inside a zip without full extraction."""
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                candidates = [n for n in zf.namelist()
+                              if "mtl" in os.path.basename(n).lower()
+                              and not n.endswith((".hdr",".img",".tif",".TIF"))]
+                if not candidates:
+                    return {}
+                with zf.open(candidates[0]) as fh:
+                    text = fh.read().decode("utf-8", errors="replace")
+            meta = {}
+            for line in text.splitlines():
+                m = re.match(r'\s+(\w+)\s*=\s*"?([^"\n]+)"?\s*$', line)
+                if m:
+                    meta[m.group(1)] = m.group(2).strip()
+            result = {}
+            if "SUN_ELEVATION" in meta:
+                result["sza"] = round(90.0 - float(meta["SUN_ELEVATION"]), 3)
+            if "ACQUISITION_DATE" in meta:
+                import datetime as _dt3
+                _d = _dt3.date.fromisoformat(meta["ACQUISITION_DATE"])
+                result["month"] = _d.month
+                result["day"]   = _d.day
+            return result
+        except Exception:
+            return {}
+
     def browse_input():
         p = filedialog.askopenfilename(
             title="Select Hyperion ZIP archive",
@@ -536,7 +611,25 @@ def run_gui():
             _set("input_path", p)
             base = os.path.splitext(p)[0]
             _set("out_base", base + "_ENVI")
-            status_lbl.config(text=f"Input: {os.path.basename(p)}")
+            # Auto-fill geometry from MTL inside the zip
+            geo = _peek_mtl(p) if zipfile.is_zipfile(p) else {}
+            if geo:
+                # Temporarily enable the fields so _set() can write into them,
+                # then restore whatever state on_type_change() would set.
+                for w in (sza_entry, month_entry, day_entry):
+                    w.config(state=tk.NORMAL)
+                if "sza"   in geo: _set("sza_deg", geo["sza"])
+                if "month" in geo: _set("month",   geo["month"])
+                if "day"   in geo: _set("day",     geo["day"])
+                # Re-apply the correct enabled/disabled state for current type
+                on_type_change()
+                status_lbl.config(
+                    text=f"Input: {os.path.basename(p)}  "
+                         f"SZA={geo.get('sza','?')} deg  "
+                         f"{geo.get('month','?')}/{geo.get('day','?')}")
+            else:
+                status_lbl.config(
+                    text=f"Input: {os.path.basename(p)}  (no MTL found)")
 
     def browse_out():
         p = filedialog.asksaveasfilename(
@@ -653,7 +746,7 @@ def run_gui():
             "interleave":  _get("interleave") or "bsq",
             "output_type": out_type,
             "refl_scale":  int(_get("refl_scale") or 10000),
-            "sza_deg":     float(_get("sza_deg") or 0.0),
+            "sza_deg":     float(_get("sza_deg")) if _get("sza_deg").strip() else None,
             "month":       int(_get("month") or 1),
             "day":         int(_get("day")   or 1),
         }
@@ -697,7 +790,7 @@ if __name__ == "__main__":
                            else os.path.splitext(sys.argv[1])[0]+"_ENVI",
             "interleave":  sys.argv[3] if len(sys.argv)>3 else "bsq",
             "output_type": sys.argv[4] if len(sys.argv)>4 else "radiance",
-            "sza_deg":     float(sys.argv[5]) if len(sys.argv)>5 else 0.0,
+            "sza_deg":     float(sys.argv[5]) if len(sys.argv)>5 else None,
             "month":       int(sys.argv[6])   if len(sys.argv)>6 else 1,
             "day":         int(sys.argv[7])   if len(sys.argv)>7 else 1,
         })
