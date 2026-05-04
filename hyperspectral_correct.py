@@ -518,6 +518,7 @@ def correct_hyperion(params, log=print):
     n_lines       = params["n_lines"]
     n_samples     = params["n_samples"]
     n_bands       = params["n_bands"]
+    wl_nm         = params["wl_nm"]
     wl_um         = params["wl_um"]
     fwhm_nm       = params["fwhm_nm"]
     bbl           = params["bbl"].copy()
@@ -1114,10 +1115,28 @@ def run_gui():
     nb.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
 
     # ═══════════════════════════════════════════════
-    # TAB 1 — Files & Geometry
+    # TAB 1 — Files & Geometry (scrollable — content may exceed window height)
     # ═══════════════════════════════════════════════
-    tab1 = ttk.Frame(nb, padding=10)
-    nb.add(tab1, text="Files & Geometry")
+    _tab1_outer = ttk.Frame(nb)
+    nb.add(_tab1_outer, text="Files & Geometry")
+
+    _t1_canvas = tk.Canvas(_tab1_outer, borderwidth=0, highlightthickness=0)
+    _t1_scroll = ttk.Scrollbar(_tab1_outer, orient=tk.VERTICAL,
+                                command=_t1_canvas.yview)
+    _t1_canvas.configure(yscrollcommand=_t1_scroll.set)
+    _t1_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+    _t1_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    tab1 = ttk.Frame(_t1_canvas, padding=10)
+    _t1_win = _t1_canvas.create_window((0, 0), window=tab1, anchor="nw")
+
+    def _t1_resize(event):
+        _t1_canvas.configure(scrollregion=_t1_canvas.bbox("all"))
+    tab1.bind("<Configure>", _t1_resize)
+    _t1_canvas.bind("<Configure>",
+        lambda e: _t1_canvas.itemconfig(_t1_win, width=e.width))
+    _t1_canvas.bind_all("<MouseWheel>",
+        lambda e: _t1_canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
 
     # Files frame
     fg = ttk.LabelFrame(tab1, text="Files", padding=6)
@@ -1259,7 +1278,7 @@ def run_gui():
     drop_cb = ttk.Checkbutton(fg,
                                text="Exclude bad bands from output  (saves disk space)",
                                command=_drop_toggle)
-    drop_cb.grid(row=6, column=0, columnspan=3, sticky=tk.W, pady=(6, 2))
+    drop_cb.grid(row=8, column=0, columnspan=3, sticky=tk.W, pady=(6, 2))
     drop_cb.state(["!alternate", "selected"])   # clear alternate, set ticked
 
     # Enable Stage-2 adjacency correction — on by default
@@ -1275,7 +1294,7 @@ def run_gui():
     adj2_cb = ttk.Checkbutton(fg,
                                text="Enable Stage-2 adjacency correction",
                                command=on_adj2_toggle)
-    adj2_cb.grid(row=7, column=0, columnspan=3, sticky=tk.W, pady=(0, 4))
+    adj2_cb.grid(row=9, column=0, columnspan=3, sticky=tk.W, pady=(0, 4))
     adj2_cb.state(["!alternate", "selected"])   # clear alternate, set ticked
 
     # Apply initial enable state (Stage-2 on -> fields active)

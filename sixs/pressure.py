@@ -26,16 +26,20 @@ def pressure(xps):
     original Fortran; sign flip done inside this function to match the
     Fortran convention).
 
-    Bug fix (2024): the original Python translation used an in-place loop
-        for i in range(1, n_keep):
-            z[i] = z[i + iinf - 1]   # reads already-modified z[i-1]!
-    which corrupts the atmospheric profile by a read-after-write hazard.
-    The profile was reduced to z=[xps, 0, 0, ...], making all subsequent
-    calls to odrayl() return near-zero or negative Rayleigh optical depths.
-    This caused the 6S path reflectance xa to be ~11x too small (~0.012
-    instead of the physically correct ~0.18 at 427 nm), effectively
-    eliminating the Rayleigh correction. Fixed by using .copy() to save
-    the original profile before shifting.
+    Bug fix (2024): the original Python translation had an off-by-one error
+    in the index expression of the profile-shift loop.  The Fortran code
+    (1-based) reads:
+        do i=2, 33-iinf+1
+            z(i) = z(i+iinf-1)
+    which in 0-based Python is:
+        for i in range(1, 34-iinf):
+            z[i] = z[i+iinf]        # correct: shift by iinf positions
+    The original translation wrote z[i+iinf-1] instead of z[i+iinf],
+    which for iinf=0 reduces to z[i]=z[i-1] — a read-after-write hazard
+    that zeroed the entire profile.  odrayl() then returned near-zero (or
+    negative) Rayleigh optical depths, making xa ≈ 0.012 instead of the
+    physically correct ≈ 0.18 at 427 nm and effectively eliminating the
+    Rayleigh path contribution from the atmospheric correction.
 
     Parameters
     ----------
@@ -73,29 +77,36 @@ def pressure(xps):
     xwo   = (wo[isup] - wo[iinf]) / (z[isup] - z[iinf]) * (xalt - z[iinf]) + wo[iinf]
     xwh   = (wh[isup] - wh[iinf]) / (z[isup] - z[iinf]) * (xalt - z[iinf]) + wh[iinf]
 
-    # Update profile: levels from isup onward shift to positions 1..n_above;
-    # the new surface level 0 is set to the interpolated values at xps.
+    # Update profile: set level 0 to the target surface; shift levels above
+    # xps into positions 1..33-iinf; pad any remaining levels.
     #
-    # Bug fix: the original Python translation used an in-place loop that read
-    # modified values (z[i] = z[i-1] corrupts z[i-1] before z[i+1] is set).
-    # Using .copy() first prevents this. The correct result is:
-    #   z_new = [xps, z_orig[isup], z_orig[isup+1], ...]
-    # which discards all levels below xps and inserts xps at the bottom.
-    import numpy as np
-    n_above = 34 - isup   # number of original levels at or above isup
-    z[1 : n_above + 1]  = z[isup:34].copy()
-    p[1 : n_above + 1]  = p[isup:34].copy()
-    t[1 : n_above + 1]  = t[isup:34].copy()
-    wh[1 : n_above + 1] = wh[isup:34].copy()
-    wo[1 : n_above + 1] = wo[isup:34].copy()
-
-    # Pad remaining levels (if any) by repeating the topmost value
-    for i in range(n_above + 1, 34):
-        z[i]  = z[n_above];  p[i]  = p[n_above]
-        t[i]  = t[n_above];  wh[i] = wh[n_above];  wo[i] = wo[n_above]
+    # Faithful translation of the Fortran loop (1-based Fortran → 0-based Python):
+    #   Fortran: z(1)=xalt first, then do i=2,33-iinf+1: z(i)=z(i+iinf-1)
+    #   Python:  z[0]=xalt first, then for i in range(1,33-iinf): z[i]=z[i+iinf]
+    # For the typical case iinf=0 (surface below z[1]): the loop is a no-op
+    # (z[i]=z[i+0]=z[i]) and only z[0] is updated.  For iinf>0 (surface above
+    # the first profile level), the loop shifts levels up by iinf positions.
+    # Note: the loop must run BEFORE setting z[0] so that z[i+iinf] still
+    # refers to the original (unmodified) profile values.
+    for i in range(1, 34 - iinf):
+        z[i]  = z[i + iinf]
+        p[i]  = p[i + iinf]
+        t[i]  = t[i + iinf]
+        wh[i] = wh[i + iinf]
+        wo[i] = wo[i + iinf]
 
     z[0]  = xalt;  p[0]  = ps;   t[0]  = xtemp
     wh[0] = xwh;   wo[0] = xwo
+
+    # Pad levels above 33-iinf by linear interpolation between l and level 34
+    l = 34 - iinf   # first index that needs padding (0-based)
+    for i in range(l, 34):
+        frac  = (i - l) / (34 - l) if (34 - l) != 0 else 0.0
+        z[i]  = (z[33] - z[l - 1]) * frac + z[l - 1]
+        p[i]  = (p[33] - p[l - 1]) * frac + p[l - 1]
+        t[i]  = (t[33] - t[l - 1]) * frac + t[l - 1]
+        wh[i] = (wh[33] - wh[l - 1]) * frac + wh[l - 1]
+        wo[i] = (wo[33] - wo[l - 1]) * frac + wo[l - 1]
 
     # Compute integrated columns
     g    = 98.1
