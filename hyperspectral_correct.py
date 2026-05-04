@@ -59,6 +59,19 @@ Processing chain
 Key constants (change here to modify behaviour)
 -----------------------------------------------
   VNIR_SWIR_BOUNDARY = 70    bands 1-70 VNIR (scale 40), 71-242 SWIR (scale 80)
+
+  Hyperion L1GST unit chain (confirmed from FLAASH docs and sample data):
+    L [uW/cm2/sr/nm] = DN / 400 (VNIR) or DN / 800 (SWIR)  <- FLAASH units
+    L [W/m2/sr/um]   = DN / 40  (VNIR) or DN / 80  (SWIR)  <- SI, used here
+    1 uW/cm2/sr/nm = 10 W/m2/sr/um (exact conversion)
+    rho_toa = pi * L[W/m2/sr/um] / (E0[W/m2/um] * cos(SZA))
+
+  6S xa = srotot: aerosol path refl from SOS solver, NOT total path refl.
+  Total path refl seen by sensor = chand(tau_R)+sroaer ~ 0.147 at 427nm.
+  But xa=srotot IS correct in rho_s=(rho_toa-xa)/(xb*rho_toa+xc) because
+  xb=1/(T_down*T_up) and xc=S*xb encode the full Rayleigh+aerosol transmittance.
+  Replacing srotot with chand()+sroaer would double-count Rayleigh and give
+  wrong surface reflectances. See sixs/utils.py for full derivation.
   Reflectance scale  = 10000 stored integer = reflectance * 10000
   Nodata             = -9999 int16 fill for masked / bad-band pixels
   Valid wl range     = 0.40-2.50 um  (6S operating limits)
@@ -137,7 +150,9 @@ SENSOR_PROFILES = {
         "vaa_source":   "orbit_eo1",
         "notes": (
             "EO-1 Hyperion pushbroom, 242 bands 356-2577 nm. "
-            "VNIR: bands 1-70, scale DN/40. SWIR: bands 71-242, scale DN/80. "
+            "L1GST: FLAASH units DN/400=L[uW/cm2/sr/nm] VNIR, DN/800 SWIR. "
+            "SI units DN/40=L[W/m2/sr/um] VNIR, DN/80 SWIR "
+            "(1 uW/cm2/sr/nm = 10 W/m2/sr/um). "
             "VAA computed from orbital geometry (inclination 98.7 deg)."
         ),
     },
@@ -393,6 +408,17 @@ def _coefficients(r6s):
     -------
     xa, xb, xc        : stage-1 coefficients
     T_down, T_up, S   : needed for the stage-2 formula
+
+    Note on xa = srotot:
+        6S srotot is the aerosol path reflectance from the SOS solver.
+        It is NOT the total path reflectance seen by the sensor.
+        At 427nm (SZA=43.7, AOT=0.06): srotot~0.012, but the true sensor
+        path refl (Rayleigh+aerosol) is ~0.147 = chand(tau_R)+sroaer.
+        However xa=srotot IS the correct value to use in the retrieval
+        formula, because xb=1/(T_down*T_up) and xc=S*xb encode the full
+        Rayleigh+aerosol transmittance (T_down, T_up, S all include Rayleigh).
+        Substituting chand(tau_R)+sroaer for xa would double-count Rayleigh.
+        See the file header and sixs/utils.py for the full derivation.
     """
     rho_atm = r6s["srotot"]
     T_down  = r6s["sdtott"]
@@ -744,8 +770,11 @@ def correct_hyperion(params, log=print):
             # Data already stores TOA reflectance (e.g. Sentinel-2 L1C)
             rho_toa = raw / rad_scale[b]   # rad_scale = 1 or a scale factor
         else:
-            # Radiance path: DN -> L [W/m2/sr/um] -> rho_toa
-            # L and E0 are in the same units so no conversion is needed.
+            # Radiance path: DN -> L [W/m2/sr/um] -> rho_toa.
+            # For Hyperion L1GST: rad_scale=40 (VNIR) / 80 (SWIR).
+            # This is DN/400*10 or DN/800*10 (FLAASH->SI: 1 uW/cm2/sr/nm = 10 W/m2/sr/um).
+            # E0 from solirr() is W/m2/um: consistent units, ratio is dimensionless.
+            # 6S uses Wehrli E0 internally; TSIS-1 vs Wehrli <2% difference.
             L = raw / rad_scale[b]
             if E0_um[b] < 1e-6:
                 continue

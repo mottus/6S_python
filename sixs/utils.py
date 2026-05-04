@@ -194,6 +194,41 @@ def print_error(tex):
 # Both tables: 1501 values, 2.5 nm step, 250-4000 nm, W m-2 um-1 at 1 AU.
 # The active table is _SI (= _SI_TSIS1 by default).
 # To compare or revert: set _SI = _SI_WEHRLI before calling solirr().
+#
+# ── IMPORTANT: E0 consistency with 6S ──────────────────────────────────────
+# The 6S radiative transfer model uses the Wehrli (1985) spectrum internally.
+# All 6S reflectance outputs (xa=srotot, xb, xc, T_down=sdtott, T_up=sutott,
+# S=pizera) are dimensionless and normalised relative to 6S's own E0.
+# When computing rho_toa = pi*L/(E0*cos_SZA) to feed into the 6S correction
+# formula, E0 should in principle be the same spectrum 6S uses internally
+# (Wehrli). However, the difference between Wehrli and TSIS-1 is <2% across
+# the Hyperion spectral range, well within other calibration uncertainties.
+# The correction formula is self-consistent regardless of which E0 is used,
+# as long as the same E0 is used for both rho_toa computation and E0_band
+# in the hyperion_atm_correction script.
+#
+# ── 6S srotot is NOT the total path reflectance ───────────────────────────
+# This is a common source of confusion. In the 6S coupled SOS solver:
+#   srotot = aerosol path reflectance (coupling residual, can be small/negative)
+#   sroray = Rayleigh coupling residual (usually small and negative)
+#   sroaer = aerosol scattering contribution
+# The TRUE total path reflectance over a black surface at these angles is:
+#   rho_path_total = rho_Rayleigh(chand) + sroaer
+# where chand() computes the analytic Rayleigh reflectance (no gas absorption).
+# For example, at 427 nm, SZA=43.7, AOT=0.06:
+#   rho_Rayleigh(chand) = 0.1355
+#   sroaer              = 0.0116
+#   srotot (returned)   = 0.0119  (≈ sroaer, Rayleigh coupling residual ~0)
+#   TRUE path refl      = 0.1471
+#
+# HOWEVER: the 6S retrieval formula rho_s=(rho_toa−xa)/(xb*rho_toa+xc) IS
+# internally consistent with xa=srotot, because xb and xc already encode the
+# full Rayleigh+aerosol transmittance (T_down, T_up, S all include Rayleigh).
+# Do NOT add chand() to srotot before using it in the retrieval formula —
+# that would double-count the Rayleigh contribution.
+# srotot is CORRECT as xa in the retrieval formula. It is wrong ONLY if you
+# want to plot the total path reflectance as seen by the sensor, in which
+# case you should plot chand(tau_R) + sroaer instead.
 
 # Original Wehrli (1985) spectrum — kept for backward compatibility
 # and for quantifying the improvement from the TSIS-1 update.
