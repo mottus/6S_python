@@ -155,6 +155,9 @@ def convert_hyperion(params, log=print):
     input_path     : str  — .zip archive or folder containing band GeoTIFFs
     out_base       : str  — output base path (no extension)
     interleave     : str  — 'bsq', 'bil', or 'bip'
+    drop_bad_bands : bool — if True (default False), exclude bands where
+                     HYPERION_BBL[i] == 0 from the output cube. The BBL
+                     field in the output ENVI header is updated accordingly.
     output_type    : str  — 'radiance' (default) or 'toa_reflectance'.
                      'radiance': store raw DN as int16, nodata=-9999.
                      'toa_reflectance': convert to TOA reflectance
@@ -176,7 +179,8 @@ def convert_hyperion(params, log=print):
     input_path  = params["input_path"]
     out_base    = params["out_base"]
     interleave  = params["interleave"].lower().strip()
-    output_type = params.get("output_type", "radiance").lower().strip()
+    drop_bad_bands = params.get("drop_bad_bands", False)
+    output_type    = params.get("output_type", "radiance").lower().strip()
     refl_scale  = int(params.get("refl_scale", 10000))
     # Use None as sentinel so we can distinguish "not set" from a genuine SZA of 0
     _sza_raw = params.get("sza_deg", None)
@@ -260,13 +264,23 @@ def convert_hyperion(params, log=print):
 
         bands_sorted = sorted(band_files.keys())
 
+        # Build output band list (0-based indices into bands_sorted/BBL)
+        if drop_bad_bands:
+            out_band_idx = [i for i, bnum in enumerate(bands_sorted)
+                            if i < len(HYPERION_BBL) and HYPERION_BBL[i] == 1]
+            log(f"  drop_bad_bands: keeping {len(out_band_idx)} / {n_found} good bands")
+        else:
+            out_band_idx = list(range(len(bands_sorted)))
+
         # ── Image dimensions from first band ──────────────────────────────────
         with rasterio.open(band_files[bands_sorted[0]]) as src:
             n_lines, n_samples = src.height, src.width
             transform = src.transform
             crs       = src.crs
 
-        log(f"Size: {n_lines} lines × {n_samples} samples × {n_found} bands")
+        n_out = len(out_band_idx)   # bands actually written to output
+        log(f"Size: {n_lines} lines × {n_samples} samples × {n_found} bands "
+            f"({n_out} written)")
 
         # ── Per-band E0 for TOA reflectance conversion ─────────────────────────
         # The 6S TSIS-1 solar spectrum is used (solirr, W/m2/um at 1 AU).
@@ -397,7 +411,7 @@ def convert_hyperion(params, log=print):
             "description":       "{ " + description + " }",
             "samples":           str(n_samples),
             "lines":             str(n_lines),
-            "bands":             str(n_found),
+            "bands":             str(n_out),
             "header offset":     "0",
             "file type":         "ENVI Standard",
             "data type":         "2",          # int16
@@ -407,10 +421,10 @@ def convert_hyperion(params, log=print):
             "data ignore value": "-9999",
             "reflectance scale": str(refl_scale) if output_type == "toa_reflectance" else None,
             "wavelength units":  "Nanometers",
-            "wavelength":        [f"{v:.2f}" for v in HYPERION_WL_NM[:n_found]],
-            "fwhm":              [f"{v:.4f}" for v in HYPERION_FWHM_NM[:n_found]],
-            "bbl":               [str(v)    for v in HYPERION_BBL[:n_found]],
-            "band names":        BAND_NAMES[:n_found],
+            "wavelength":        [f"{HYPERION_WL_NM[i]:.2f}" for i in out_band_idx],
+            "fwhm":              [f"{HYPERION_FWHM_NM[i]:.4f}" for i in out_band_idx],
+            "bbl":               [str(HYPERION_BBL[i])          for i in out_band_idx],
+            "band names":        [BAND_NAMES[i]                 for i in out_band_idx],
         }
         if map_info:
             envi_meta["map info"] = map_info
@@ -436,18 +450,19 @@ def convert_hyperion(params, log=print):
 
         # ── Read bands, convert if needed, and write ──────────────────────────
         mode_str = "TOA reflectance" if output_type == "toa_reflectance" else "radiance"
-        log(f"Writing {n_found} bands ({mode_str})...")
+        log(f"Writing {n_out} bands ({mode_str})...")
         _pct_logged = -1
-        for out_b, band_num in enumerate(bands_sorted):
+        for out_b, src_b in enumerate(out_band_idx):
+            band_num = bands_sorted[src_b]
             with rasterio.open(band_files[band_num]) as src_r:
                 dn = src_r.read(1).astype(np.float32)  # (lines, samples)
 
             if output_type == "toa_reflectance" and E0_band is not None:
-                # DN -> radiance [W/m2/sr/um]
-                L = dn / rad_scale_arr[out_b]
+                # DN -> radiance [W/m2/sr/um]; use src_b to index into full-242 arrays
+                L = dn / rad_scale_arr[src_b]
                 # Radiance -> TOA reflectance (dimensionless)
                 # Both L and E0 are in W/m2/um so the ratio is dimensionless.
-                E0 = E0_band[out_b]
+                E0 = E0_band[src_b]
                 rho = (np.pi * L) / (E0 * cos_sza) if E0 > 1e-6 else np.zeros_like(L)
                 rho = np.clip(rho, 0.0, 1.5)
                 band_data = np.clip(rho * refl_scale, -32768, 32767).astype(np.int16)
@@ -456,7 +471,7 @@ def convert_hyperion(params, log=print):
                 band_data = dn.astype(np.int16)
 
             out_mm[:, :, out_b] = band_data
-            pct = int((out_b + 1) / n_found * 100)
+            pct = int((out_b + 1) / n_out * 100)
             if pct // 10 > _pct_logged // 10:
                 _pct_logged = pct
                 log(f"  {pct:3d}%  (band {band_num}/{bands_sorted[-1]})")
@@ -466,13 +481,13 @@ def convert_hyperion(params, log=print):
         # ── Valid-pixel mask ──────────────────────────────────────────────────
         log("\nBuilding valid-pixel mask (all-zero pixels = fill)...")
         band_sum = np.zeros((n_lines, n_samples), dtype=np.int32)
-        for out_b in range(n_found):
+        for out_b in range(n_out):
             band_sum += np.abs(out_mm[:, :, out_b].astype(np.int32))
         valid = (band_sum > 0)
         log(f"  Valid: {valid.sum()}  Fill: {(~valid).sum()}")
 
         # Apply nodata to fill pixels
-        for out_b in range(n_found):
+        for out_b in range(n_out):
             tmp = out_mm[:, :, out_b].copy()
             tmp[~valid] = -9999
             out_mm[:, :, out_b] = tmp
@@ -484,6 +499,7 @@ def convert_hyperion(params, log=print):
         mask_meta = {
             "description":   (f"{{ EO-1 Hyperion valid-pixel mask. "
                                f"1=valid 0=fill (all-zero DN). "
+                               f"Image bands: {n_out} ({'BBL-filtered' if drop_bad_bands else 'all'}). "
                                f"Source: {os.path.basename(input_path)}. "
                                f"Converted: {now_str}. }}"),
             "samples":       str(n_samples),
@@ -717,6 +733,18 @@ def run_gui():
                    "BIL = by line  BIP = by pixel",
               foreground="gray").grid(row=0, column=2, sticky=tk.W)
 
+    # Bad-band exclusion
+    bg = ttk.LabelFrame(tab1, text="Band selection", padding=8)
+    bg.pack(fill=tk.X, pady=(6, 0))
+    drop_var = tk.BooleanVar(value=False)
+    ttk.Checkbutton(bg, text="Exclude bad bands (BBL = 0)",
+                    variable=drop_var).grid(row=0, column=0, sticky=tk.W)
+    ttk.Label(bg,
+              text=f"  ({sum(1 for b in HYPERION_BBL if b==0)} bands excluded: "
+                   f"bands 1-7, 58-76, 225-242)",
+              foreground="gray").grid(row=0, column=1, sticky=tk.W)
+    e["drop_bad_bands"] = drop_var
+
     # ── Log tab ───────────────────────────────────────────────────────────────
     tab2 = ttk.Frame(nb, padding=4)
     nb.add(tab2, text="Log")
@@ -744,6 +772,7 @@ def run_gui():
             "input_path":  inp,
             "out_base":    _get("out_base") or os.path.splitext(inp)[0]+"_ENVI",
             "interleave":  _get("interleave") or "bsq",
+            "drop_bad_bands": e["drop_bad_bands"].get(),
             "output_type": out_type,
             "refl_scale":  int(_get("refl_scale") or 10000),
             "sza_deg":     float(_get("sza_deg")) if _get("sza_deg").strip() else None,

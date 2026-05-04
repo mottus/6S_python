@@ -99,8 +99,71 @@ def run6S(input_stream=None, output_stream=None):
 
     Returns
     -------
-    dict : computed results including apparent reflectance, direct/diffuse
-           irradiance and all integrated quantities.
+    dict – see example_run.py for a full worked example of every key.
+
+    Input metadata:
+        day, month       acquisition date
+        sza              solar zenith angle (degrees)
+        h2o              precipitable water vapour (g cm⁻²)
+        o3               ozone column (cm-atm)
+        aot550           aerosol optical depth at 550 nm
+
+    Geometry:
+        asol/phi0/avis/phiv    solar/view zenith and azimuth (degrees)
+        xmus/xmuv/xmud         cos(solar zenith)/cos(view zenith)/cos(scattering angle)
+
+    Apparent reflectance (band-integrated, dimensionless):
+        apparent_reflectance          TOA reflectance = π L_toa / (E₀ cos SZA)
+        apparent_reflectance_atm_only path contribution only (black surface)
+        apparent_reflectance_Rayleigh Rayleigh-only path contribution
+        apparent_radiance             TOA radiance (W m⁻² sr⁻¹ µm⁻¹)
+
+    Surface reflectance (retrieval mode only, rapp < 0):
+        rog    retrieved surface reflectance
+
+    Path reflectance (SOS decomposition):
+        srotot  total = sroray + sroaer. Use as xa in retrieval formula.
+                NOT the physical path refl. as seen by sensor (which is
+                approximately chand(tau_R) + sroaer ~ 0.18 at 427 nm).
+                Self-consistent with sdtott/sutott/sast.
+        sroray  Rayleigh-aerosol coupling correction; negative in blue because
+                aerosol forward-scattering reduces Rayleigh backscatter.
+        sroaer  aerosol contribution to path reflectance
+
+    Optical depths (band-integrated):
+        sodray / sodaer / sodtot    Rayleigh / aerosol / total
+
+    Spherical albedo (band-integrated):
+        spherical_albedo_tot (sast)  TOTAL atmospheric spherical albedo.
+                                     Use as 's' in retrieval denominator:
+                                     rho_s=(rho_toa-xa)/(T_d*T_u+s*(rho_toa-xa))
+        spherical_albedo_ray (sasr)  Rayleigh component
+        spherical_albedo_aer (sasa)  aerosol component
+        pizera   aerosol single-scatter albedo ω₀. NOT spherical albedo.
+
+    Transmittances (band-integrated):
+        sdtott/sutott         total downward/upward (Rayleigh + aerosol + gas)
+        sdtotr/sutotr         Rayleigh component
+        sdtota/sutota         aerosol component
+        sdwava/suwava/stwava  water vapour down/up/total
+        sdozon/suozon/stozon  ozone down/up/total
+        tgasm/dgasm/ugasm     total/downward/upward gas transmittance
+
+    Ground irradiances (W m⁻² µm⁻¹ at target surface):
+        ground_direct_irr / ground_diffuse_irr / ground_env_irr
+        ground_direct_fraction / ground_diffuse_fraction / ground_env_fraction
+
+    Satellite radiances (W m⁻² sr⁻¹ µm⁻¹ and W m⁻²):
+        atm_radiance / atm_radiance_wm2       atmospheric path
+        env_radiance / env_radiance_wm2       environment
+        target_radiance / target_radiance_wm2 target surface
+
+    Band-integrated irradiances (W m⁻² µm⁻¹):
+        direct_irr   direct beam (= ground_direct_irr)
+        diffuse_irr  diffuse sky (= ground_diffuse_irr)
+
+    Per-wavelength arrays:
+        spec_wl / spec_dir / spec_dif  wavelength, direct, diffuse irradiances
     """
     _opened = False
     if input_stream is None:
