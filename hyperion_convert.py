@@ -429,11 +429,15 @@ def convert_hyperion(params, log=print):
         if map_info:
             envi_meta["map info"] = map_info
 
-        # ── Safety: do not overwrite input ────────────────────────────────────
-        if os.path.abspath(out_base) == os.path.abspath(
-                os.path.splitext(input_path)[0]):
+        # ── Safety: do not overwrite the input file itself ────────────────────
+        # The output is always an ENVI pair (out_base.hdr + out_base.img/bsq/…),
+        # so using the same stem as the input ZIP is fine — the extensions differ.
+        # Only raise if out_base exactly matches an existing non-ENVI file that
+        # could be silently clobbered (e.g. if input_path has no extension).
+        if (os.path.abspath(out_base) == os.path.abspath(input_path)
+                or os.path.abspath(out_base + ".zip") == os.path.abspath(input_path)):
             raise ValueError(
-                "Output path is the same as the input — choose a different name.")
+                "Output path would overwrite the input file — choose a different name.")
 
         # ── Create output ENVI file ───────────────────────────────────────────
         # Remove any metadata fields set to None (conditional on output_type)
