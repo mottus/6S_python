@@ -637,8 +637,8 @@ def correct_hyperion(params, log=print):
     log(f"  Output interleave: {interleave.upper()}")
     log(f"  Drop bad bands : {'yes' if drop_bad_bands else 'no'}")
     if do_adj2:
-        log(f"  Stage-2 adj    : ON  radius={adj2_radius_km:.1f} km  "
-            f"pixel={pixel_size_m:.0f} m  output={adj2_out_base}")
+        log(f"  Stage-2 adj    : ON  radius={adj2_radius_km:.2f} km  "
+            f"sigma={adj2_radius_km*1000/pixel_size_m:.1f} px  output={adj2_out_base}")
     else:
         log(f"  Stage-2 adj    : OFF")
     log(f"  Good bands     : {bbl.sum()} / {n_bands}")
@@ -716,9 +716,11 @@ def correct_hyperion(params, log=print):
         try:
             r = run6S(io.StringIO(inp), io.StringIO(), n_harmonics=n_harmonics)
             xa[b], xb[b], xc[b], T_down_arr[b], T_up_arr[b], S_arr[b] = _coefficients(r)
-            # Direct-beam downward transmittance = ground_direct_fraction * sdtott
-            # (ground_direct_fraction = direct/(direct+diffuse) fraction of surface irradiance)
-            T_dir_arr[b] = r.get("ground_direct_fraction", 1.0) * T_down_arr[b]
+            # Direct-beam downward transmittance = direct_irr / (E0 * cos_sza).
+            # Note: ground_direct_fraction = dir_irr/(dir_irr+dif_irr), which
+            # differs from T_dir = dir_irr/(E0*cos_sza). Use irradiance directly.
+            T_dir_arr[b] = (r.get("ground_direct_irr", 0.0) / (E0_um[b] * cos_sza)
+                            if E0_um[b] * cos_sza > 1e-6 else T_down_arr[b])
             _spec_rows.append((
                 wl_nm[b],
                 r.get("atm_radiance",      float("nan")),
@@ -1526,10 +1528,10 @@ def run_gui():
     # Smoothing radius
     ttk.Label(adj2g, text="Smoothing radius (km):").grid(row=0, column=0, sticky=tk.W, pady=2)
     adj2_radius_e = ttk.Entry(adj2g, width=10)
-    adj2_radius_e.insert(0, "1.0")
+    adj2_radius_e.insert(0, "0.2")
     adj2_radius_e.grid(row=0, column=1, sticky=tk.W, padx=4)
     e["adj2_radius_km"] = adj2_radius_e
-    ttk.Label(adj2g, text="Gaussian kernel radius for rho_env estimate",
+    ttk.Label(adj2g, text="Gaussian smoothing radius for rho_env. 0.1-0.5 km recommended for Hyperion 30 m pixels.",
               foreground="gray").grid(row=0, column=2, columnspan=2, sticky=tk.W)
 
     # Pixel size
@@ -1540,6 +1542,22 @@ def run_gui():
     e["pixel_size_m"] = adj2_pixel_e
     ttk.Label(adj2g, text="Hyperion GSD = 30 m",
               foreground="gray").grid(row=1, column=2, sticky=tk.W)
+
+    # SOS solver harmonics
+    sosg = ttk.LabelFrame(tab2, text="SOS solver", padding=8)
+    sosg.pack(fill=tk.X, pady=(8, 0))
+
+    ttk.Label(sosg, text="Fourier harmonics:").grid(row=0, column=0, sticky=tk.W)
+    harmonics_var = tk.StringVar(value="3")
+    harmonics_cb  = ttk.Combobox(sosg, textvariable=harmonics_var, width=6,
+                                  state="readonly",
+                                  values=["1", "2", "3", "4", "6", "8", "10",
+                                          "15", "20", "40", "81"])
+    harmonics_cb.grid(row=0, column=1, sticky=tk.W, padx=6)
+    e["n_harmonics"] = harmonics_var
+    ttk.Label(sosg,
+              text="3 = exact for Rayleigh, AOT<0.5  |  ≥6 for heavy aerosol  |  81 = Fortran default",
+              foreground="gray").grid(row=0, column=2, sticky=tk.W)
 
     # ═══════════════════════════════════════════════
     # TAB 3 — Log
@@ -1607,6 +1625,7 @@ def run_gui():
             adj2_out_base   = (_get("adj2_out_base") or None) if _adj2[0] else None,
             adj2_radius_km  = _get("adj2_radius_km", float),
             pixel_size_m    = _get("pixel_size_m",   float),
+            n_harmonics     = int(harmonics_var.get()),
             env_model       = ENV_MODELS.get(_get("env_model_name"), None),
             env_radius_km = _get("env_radius_km", float),
             **{k: hdr_data[k] for k in
