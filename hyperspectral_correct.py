@@ -1,1053 +1,557 @@
 """
-hyperspectral_correct.py
---------------------------
-Atmospheric correction of EO-1 Hyperion L1T hyperspectral imagery using 6S
-(Second Simulation of the Satellite Signal in the Solar Spectrum).
+hyperion_convert.py
+-------------------
+Convert a USGS EO-1 Hyperion L1G/T archive (ZIP or folder of per-band
+GeoTIFF files) to a single ENVI hyperspectral cube.
+
+Equivalent to the basic import functionality of Hyperion Tools 2.0
+(White 2016), without georeferencing interpolation.
 
 Usage
 -----
-  GUI    : python hyperspectral_correct.py
-  Script : python hyperspectral_correct.py file.hdr [file.L1T]
-  Import : from hyperspectral_correct import read_mtl, read_hdr, correct_hyperion
+  GUI    : python hyperion_convert.py
+  Script : python hyperion_convert.py  input.zip  output_base  [bsq|bil|bip]
 
-Processing chain
-----------------
-1.  Read metadata
-    - MTL  -> geometry (SZA, SAA, VZA, VAA), date, radiance scaling factors
-    - HDR  -> image dimensions, wavelengths (nm), FWHM, bad-band list (bbl)
+Processing
+----------
+1. Unzip the archive (or read a folder) to a temporary directory.
+2. Find the MTL metadata file (filename contains "MTL").
+3. Read all per-band GeoTIFF files (B001..B242). Warn if not exactly 242.
+4. Concatenate into a single ENVI file in the chosen interleave.
+5. Build a valid-pixel mask: pixels where ALL bands are zero are fill/nodata.
+6. Write:
+     <output_base>.hdr / .img          — radiance cube (int16, DN)
+     <output_base>_mask.hdr / .img     — mask (1=valid, 0=fill, int16, BSQ)
+     <output_dir>/<scene_id>_MTL.L1T   — copy of the MTL file
 
-2.  Build valid-pixel mask
-    - External mask file if given (any ENVI file, non-zero = valid)
-    - Auto: pixels where ALL bands are zero (sensor fill / black edges)
+Radiance scaling (applied OUTSIDE this tool, e.g. in atmospheric correction):
+  VNIR (bands 1-70):   L [W/m2/sr/um] = DN / 40
+  SWIR (bands 71-242): L [W/m2/sr/um] = DN / 80
 
-3.  Create output file before computation
-    - Allocates disk space immediately (int16, interleave managed by spectral)
-    - Pre-filled with nodata = -9999
-
-4.  Open input as read-only memory map  (one band read at a time)
-
-5.  For each good band (bbl=1, wavelength 0.40-2.50 um):
-    a. Run 6S (monochromatic, iwave=-1) -> correction coefficients:
-         xa = atmospheric path reflectance   (= srotot)
-         xb = 1 / (T_down * T_up)
-         xc = spherical_albedo / (T_down * T_up)
-       If inhomo=1 is chosen, 6S also accounts for the adjacency effect:
-       light reflected by the surrounding environment is scattered toward
-       the sensor, making dark pixels near bright areas appear brighter.
-       The environment type (vegetation/water/sand/lake) and patch radius
-       are user-selectable.
-    b. Get TOA solar irradiance E0 from built-in 6S solar spectrum (solirr),
-       corrected for Earth-Sun distance on the acquisition date (Spencer 1971
-       approximation based on day-of-year).
-    c. DN -> radiance:  L [W/m2/sr/um] = DN / scale_factor
-         VNIR (bands 1-70):  scale = 40
-         SWIR (bands 71-242): scale = 80
-    d. TOA reflectance:  rho_toa = pi * L / (E0 * cos(SZA))
-       Units: L and E0 both in W/m2, ratio is dimensionless.
-    e. Surface reflectance (Vermote et al. 1997):
-         rho_s = (rho_toa - xa) / (xb * rho_toa + xc)
-    f. Scale to int16:  stored = round(rho_s * 10000)
-       To recover reflectance: rho_s = stored_value / 10000.0
-       Nodata (masked pixels) = -9999
-
-6.  Write ENVI header:
-    - sensor type = EO-1 Hyperion
-    - band names = B1 (356nm), B2 (366nm), ...
-    - wavelengths rounded to 2 decimal places (nm)
-    - description with all processing parameters
-
-Key constants (change here to modify behaviour)
------------------------------------------------
-  VNIR_SWIR_BOUNDARY = 70    bands 1-70 VNIR (scale 40), 71-242 SWIR (scale 80)
-
-  Hyperion L1GST unit chain (confirmed from FLAASH docs and sample data):
-    L [uW/cm2/sr/nm] = DN / 400 (VNIR) or DN / 800 (SWIR)  <- FLAASH units
-    L [W/m2/sr/um]   = DN / 40  (VNIR) or DN / 80  (SWIR)  <- SI, used here
-    1 uW/cm2/sr/nm = 10 W/m2/sr/um (exact conversion)
-    rho_toa = pi * L[W/m2/sr/um] / (E0[W/m2/um] * cos(SZA))
-
-  6S xa = srotot: aerosol path refl from SOS solver, NOT total path refl.
-  Total path refl seen by sensor = chand(tau_R)+sroaer ~ 0.147 at 427nm.
-  But xa=srotot IS correct in rho_s=(rho_toa-xa)/(xb*rho_toa+xc) because
-  xb=1/(T_down*T_up) and xc=S*xb encode the full Rayleigh+aerosol transmittance.
-  Replacing srotot with chand()+sroaer would double-count Rayleigh and give
-  wrong surface reflectances. See sixs/utils.py for full derivation.
-  Reflectance scale  = 10000 stored integer = reflectance * 10000
-  Nodata             = -9999 int16 fill for masked / bad-band pixels
-  Valid wl range     = 0.40-2.50 um  (6S operating limits)
-
-Requirements: pip install spectral numpy scipy
-              pip install -e /path/to/sixs_python
+Requirements: pip install spectral rasterio numpy
 """
 
-import os, io, re, math, datetime, warnings
+import os, re, shutil, zipfile, tempfile, datetime, glob
 import numpy as np
-warnings.filterwarnings("ignore")
 
+# ── Hyperion spectral calibration ─────────────────────────────────────────────
+# Hard-coded from the EO-1 Hyperion instrument specification.
+# Values sourced from a real L1T header (identical for all scenes).
+# 242 bands total: bands 1-70 = VNIR detector, 71-242 = SWIR detector.
+# Note: bands 71-76 of the SWIR detector overlap with VNIR in wavelength
+# (this is normal — the two detectors have independent focal planes).
 
-# -- Atmospheric / aerosol model menus ----------------------------------------
-ATM_MODELS = {
-    "No absorption (idatm=0)":       0,
-    "Tropical (idatm=1)":            1,
-    "Mid-lat summer (idatm=2)":      2,
-    "Mid-lat winter (idatm=3)":      3,
-    "Subarctic summer (idatm=4)":    4,
-    "Subarctic winter (idatm=5)":    5,
-    "US Standard 1962 (idatm=6)":    6,
-    "User H2O + O3 (idatm=8)":       8,
-}
-DEFAULT_ATM = "Mid-lat summer (idatm=2)"
+HYPERION_WL_NM = [
+    355.59, 365.76, 375.94, 386.11, 396.29, 406.46, 416.64, 426.82, 436.99,
+    447.17, 457.34, 467.52, 477.69, 487.87, 498.04, 508.22, 518.39, 528.57,
+    538.74, 548.92, 559.09, 569.27, 579.45, 589.62, 599.80, 609.97, 620.15,
+    630.32, 640.50, 650.67, 660.85, 671.02, 681.20, 691.37, 701.55, 711.72,
+    721.90, 732.07, 742.25, 752.43, 762.60, 772.78, 782.95, 793.13, 803.30,
+    813.48, 823.65, 833.83, 844.00, 854.18, 864.35, 874.53, 884.70, 894.88,
+    905.05, 915.23, 925.41, 935.58, 945.76, 955.93, 966.11, 976.28, 986.46,
+    996.63, 1006.81, 1016.98, 1027.16, 1037.33, 1047.51, 1057.68, 851.92, 862.01,
+    872.10, 882.19, 892.28, 902.36, 912.45, 922.54, 932.64, 942.73, 952.82,
+    962.91, 972.99, 983.08, 993.17, 1003.30, 1013.30, 1023.40, 1033.49, 1043.59,
+    1053.69, 1063.79, 1073.89, 1083.99, 1094.09, 1104.19, 1114.19, 1124.28, 1134.38,
+    1144.48, 1154.58, 1164.68, 1174.77, 1184.87, 1194.97, 1205.07, 1215.17, 1225.17,
+    1235.27, 1245.36, 1255.46, 1265.56, 1275.66, 1285.76, 1295.86, 1305.96, 1316.05,
+    1326.05, 1336.15, 1346.25, 1356.35, 1366.45, 1376.55, 1386.65, 1396.74, 1406.84,
+    1416.94, 1426.94, 1437.04, 1447.14, 1457.23, 1467.33, 1477.43, 1487.53, 1497.63,
+    1507.73, 1517.83, 1527.92, 1537.92, 1548.02, 1558.12, 1568.22, 1578.32, 1588.42,
+    1598.51, 1608.61, 1618.71, 1628.81, 1638.81, 1648.90, 1659.00, 1669.10, 1679.20,
+    1689.30, 1699.40, 1709.50, 1719.60, 1729.70, 1739.70, 1749.79, 1759.89, 1769.99,
+    1780.09, 1790.19, 1800.29, 1810.38, 1820.48, 1830.58, 1840.58, 1850.68, 1860.78,
+    1870.87, 1880.98, 1891.07, 1901.17, 1911.27, 1921.37, 1931.47, 1941.57, 1951.57,
+    1961.66, 1971.76, 1981.86, 1991.96, 2002.06, 2012.15, 2022.25, 2032.35, 2042.45,
+    2052.45, 2062.55, 2072.65, 2082.75, 2092.84, 2102.94, 2113.04, 2123.14, 2133.24,
+    2143.34, 2153.34, 2163.43, 2173.53, 2183.63, 2193.73, 2203.83, 2213.93, 2224.03,
+    2234.12, 2244.22, 2254.22, 2264.32, 2274.42, 2284.52, 2294.61, 2304.71, 2314.81,
+    2324.91, 2335.01, 2345.11, 2355.21, 2365.20, 2375.30, 2385.40, 2395.50, 2405.60,
+    2415.70, 2425.80, 2435.89, 2445.99, 2456.09, 2466.09, 2476.19, 2486.29, 2496.39,
+    2506.48, 2516.59, 2526.68, 2536.78, 2546.88, 2556.98, 2566.98, 2577.08,
+]
 
-AEROSOL_MODELS = {
-    "None (iaer=0)":         0,
-    "Continental (iaer=1)":  1,
-    "Maritime (iaer=2)":     2,
-    "Urban (iaer=3)":        3,
-}
-DEFAULT_AER = "Continental (iaer=1)"
+HYPERION_FWHM_NM = [
+    11.3871, 11.3871, 11.3871, 11.3871, 11.3871, 11.3871, 11.3871, 11.3871, 11.3871,
+    11.3871, 11.3871, 11.3871, 11.3871, 11.3784, 11.3538, 11.3133, 11.2580, 11.1907,
+    11.1119, 11.0245, 10.9321, 10.8368, 10.7407, 10.6482, 10.5607, 10.4823, 10.4147,
+    10.3595, 10.3188, 10.2942, 10.2856, 10.2980, 10.3349, 10.3909, 10.4592, 10.5322,
+    10.6004, 10.6562, 10.6933, 10.7058, 10.7276, 10.7907, 10.8833, 10.9938, 11.1044,
+    11.1980, 11.2600, 11.2824, 11.2822, 11.2816, 11.2809, 11.2797, 11.2782, 11.2771,
+    11.2765, 11.2756, 11.2754, 11.2754, 11.2754, 11.2754, 11.2754, 11.2754, 11.2754,
+    11.2754, 11.2754, 11.2754, 11.2754, 11.2754, 11.2754, 11.2754, 11.0457, 11.0457,
+    11.0457, 11.0457, 11.0457, 11.0457, 11.0457, 11.0457, 11.0457, 11.0457, 11.0457,
+    11.0457, 11.0457, 11.0457, 11.0457, 11.0457, 11.0457, 11.0451, 11.0423, 11.0372,
+    11.0302, 11.0218, 11.0122, 11.0013, 10.9871, 10.9732, 10.9572, 10.9418, 10.9248,
+    10.9065, 10.8884, 10.8696, 10.8513, 10.8335, 10.8154, 10.7979, 10.7822, 10.7663,
+    10.7520, 10.7385, 10.7270, 10.7174, 10.7091, 10.7022, 10.6970, 10.6946, 10.6937,
+    10.6949, 10.6996, 10.7058, 10.7163, 10.7283, 10.7437, 10.7612, 10.7807, 10.8034,
+    10.8267, 10.8534, 10.8818, 10.9110, 10.9422, 10.9743, 11.0074, 11.0414, 11.0759,
+    11.1108, 11.1461, 11.1811, 11.2156, 11.2496, 11.2826, 11.3146, 11.3460, 11.3753,
+    11.4037, 11.4302, 11.4538, 11.4760, 11.4958, 11.5133, 11.5286, 11.5404, 11.5505,
+    11.5580, 11.5621, 11.5634, 11.5617, 11.5563, 11.5477, 11.5346, 11.5193, 11.5002,
+    11.4789, 11.4548, 11.4279, 11.3994, 11.3688, 11.3366, 11.3036, 11.2696, 11.2363,
+    11.2007, 11.1666, 11.1333, 11.1018, 11.0714, 11.0424, 11.0155, 10.9912, 10.9698,
+    10.9508, 10.9355, 10.9230, 10.9139, 10.9083, 10.9069, 10.9057, 10.9013, 10.8951,
+    10.8854, 10.8740, 10.8591, 10.8429, 10.8242, 10.8039, 10.7820, 10.7592, 10.7342,
+    10.7092, 10.6834, 10.6572, 10.6312, 10.6052, 10.5803, 10.5560, 10.5328, 10.5101,
+    10.4904, 10.4722, 10.4552, 10.4408, 10.4285, 10.4197, 10.4129, 10.4088, 10.4077,
+    10.4077, 10.4077, 10.4077, 10.4077, 10.4077, 10.4077, 10.4077, 10.4077, 10.4077,
+    10.4077, 10.4077, 10.4077, 10.4077, 10.4077, 10.4077, 10.4077, 10.4077, 10.4077,
+    10.4077, 10.4077, 10.4077, 10.4077, 10.4077, 10.4077, 10.4077, 10.4077,
+]
 
-# inhomo=1 environment surface types (igrou2 codes for 6S)
-ENV_MODELS = {
-    "Uniform (inhomo=0, no adjacency)": None,   # None = inhomo=0
-    "Vegetation":    1,
-    "Clear water":   2,
-    "Sand":          3,
-    "Lake water":    4,
-}
-DEFAULT_ENV = "Vegetation"
-DEFAULT_ENV_RADIUS_KM = 2.0   # typical atmospheric PSF radius at low AOT
+# Bad-band list: 1 = usable, 0 = unusable (uncalibrated or artefact-affected).
+# Bad ranges: bands 1-7 (VNIR pre-range), 58-76 (VNIR/SWIR overlap / gap),
+#             225-242 (SWIR end-of-range).
+HYPERION_BBL = [
+    0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+]
 
-# ── Sensor profiles ───────────────────────────────────────────────────────────
-# Each profile defines the sensor-specific parameters that do not come from
-# the image header or the atmospheric model.
-#
-# Keys:
-#   display_name  : shown in the GUI dropdown
-#   sensor_type   : written to the ENVI output header
-#   input_type    : "radiance" — image stores DN or physical radiance,
-#                               ρ_toa = π·L/(E0·cos(SZA)), E0 from solirr()
-#                   "toa_refl" — image already stores TOA reflectance,
-#                               skip L→ρ_toa step
-#   rad_scale     : how to build the per-band radiance scale array.
-#                   "uniform:<val>"  — divide every band by <val>
-#                   "split:<vnir>:<swir>:<boundary>" — bands 1..<boundary>
-#                       divide by <vnir>, remainder by <swir> (1-based boundary)
-#                   "none"           — data already in W/m2/sr/um (scale = 1)
-#   pixel_size_m  : nominal ground sampling distance (used for adj2 default)
-#   vaa_source    : "orbit_eo1" — compute VAA from EO-1 orbital geometry
-#                   "manual"   — user must enter VAA directly
-#   notes         : free text shown as tooltip / help string
+EXPECTED_BANDS = 242
 
-SENSOR_PROFILES = {
-    "EO-1 Hyperion": {
-        "display_name": "EO-1 Hyperion",
-        "sensor_type":  "EO-1 Hyperion",
-        "input_type":   "radiance",
-        # VNIR (bands 1-70) scale 40, SWIR (bands 71-242) scale 80
-        # Units after scaling: W/m2/sr/um  (confirmed from NASA calibration docs)
-        "rad_scale":    "split:40:80:70",
-        "pixel_size_m": 30.0,
-        "vaa_source":   "orbit_eo1",
-        "notes": (
-            "EO-1 Hyperion pushbroom, 242 bands 356-2577 nm. "
-            "L1GST: FLAASH units DN/400=L[uW/cm2/sr/nm] VNIR, DN/800 SWIR. "
-            "SI units DN/40=L[W/m2/sr/um] VNIR, DN/80 SWIR "
-            "(1 uW/cm2/sr/nm = 10 W/m2/sr/um). "
-            "VAA computed from orbital geometry (inclination 98.7 deg)."
-        ),
-    },
-    # ── Add further sensors below ─────────────────────────────────────────────
-    # "Sentinel-2 MSI": {
-    #     "display_name": "Sentinel-2 MSI",
-    #     "sensor_type":  "Sentinel-2 MSI",
-    #     "input_type":   "toa_refl",   # L1C product is BOA or TOA reflectance
-    #     "rad_scale":    "none",
-    #     "pixel_size_m": 10.0,
-    #     "vaa_source":   "manual",
-    #     "notes": "Sentinel-2 L1C TOA reflectance. No radiance scaling needed.",
-    # },
-    # "Generic radiance sensor": {
-    #     "display_name": "Generic radiance sensor",
-    #     "sensor_type":  "Unknown",
-    #     "input_type":   "radiance",
-    #     "rad_scale":    "uniform:1",   # already in W/m2/sr/um
-    #     "pixel_size_m": 30.0,
-    #     "vaa_source":   "manual",
-    #     "notes": "Generic sensor: image in W/m2/sr/um, enter all geometry manually.",
-    # },
-}
-DEFAULT_PROFILE = "EO-1 Hyperion"
+# Short band names for the ENVI header, referencing original band numbers.
+BAND_NAMES = [f"B{i+1} ({HYPERION_WL_NM[i]:.2f}nm)" for i in range(EXPECTED_BANDS)]
 
-
-def build_rad_scale(profile_rad_scale, n_bands):
-    """
-    Build a numpy array of per-band radiance scale factors from a
-    profile rad_scale string.  Returns array of shape (n_bands,).
-    """
-    spec = profile_rad_scale
-    if spec == "none" or spec.startswith("uniform:1"):
-        return np.ones(n_bands, dtype=np.float32)
-    if spec.startswith("uniform:"):
-        val = float(spec.split(":")[1])
-        return np.full(n_bands, val, dtype=np.float32)
-    if spec.startswith("split:"):
-        _, vnir_s, swir_s, bnd_s = spec.split(":")
-        vnir_scale = float(vnir_s)
-        swir_scale = float(swir_s)
-        boundary   = int(bnd_s)          # 1-based last VNIR band
-        arr = np.full(n_bands, swir_scale, dtype=np.float32)
-        arr[:boundary] = vnir_scale      # bands 0..boundary-1 (0-based)
-        return arr
-    raise ValueError(f"Unknown rad_scale spec: '{spec}'")
+assert len(HYPERION_WL_NM)   == EXPECTED_BANDS
+assert len(HYPERION_FWHM_NM) == EXPECTED_BANDS
+assert len(HYPERION_BBL)     == EXPECTED_BANDS
 
 
 # =============================================================================
-# SECTION 1 -- Metadata readers
-# Return plain dicts so the computation has no file-format coupling.
-# Values can also be supplied directly to correct_hyperion() without file I/O.
+# SECTION 1 — MTL reader
 # =============================================================================
 
-def read_mtl(mtl_path):
-    """
-    Parse an EO-1 Hyperion L1T MTL file.
-
-    Returns dict with keys:
-        acq_date, start_time, month, day,
-        sza, saa, vza, vaa,
-        scale_vnir, scale_swir,
-        n_lines, n_samples
-    """
-    raw = {}
-    with open(mtl_path) as f:
+def parse_mtl(mtl_path):
+    """Read a Hyperion L1T/MTL text file and return a flat key-value dict."""
+    meta = {}
+    with open(mtl_path, errors="replace") as f:
         for line in f:
             m = re.match(r'\s+(\w+)\s*=\s*"?([^"\n]+)"?\s*$', line)
             if m:
-                raw[m.group(1)] = m.group(2).strip()
+                meta[m.group(1)] = m.group(2).strip()
+    return meta
 
-    acq_date      = raw["ACQUISITION_DATE"]
-    start_time    = raw["START_TIME"]
-    sun_elevation = float(raw["SUN_ELEVATION"])
-    sun_azimuth   = float(raw["SUN_AZIMUTH"])
-    look_angle    = float(raw["SENSOR_LOOK_ANGLE"])  # signed: + east, - west
-    scale_vnir    = float(raw.get("SCALING_FACTOR_VNIR", 40))
-    scale_swir    = float(raw.get("SCALING_FACTOR_SWIR", 80))
-    dt  = datetime.date.fromisoformat(acq_date)
-    sza = 90.0 - sun_elevation
-    saa = sun_azimuth
 
-    # VZA is always the absolute off-nadir angle (positive in 6S).
-    vza = abs(look_angle)
+# =============================================================================
+# SECTION 2 — Conversion
+# =============================================================================
 
-    # ── Compute VAA from EO-1 orbit geometry ─────────────────────────────────
-    #
-    # Background
-    # ----------
-    # The MTL file provides SENSOR_LOOK_ANGLE with a SIGN but no azimuth:
-    #   positive = looking east of the ground track
-    #   negative = looking west of the ground track
-    # 6S requires the VIEW AZIMUTH (VAA) in degrees from North, clockwise —
-    # the same convention as the solar azimuth (SAA).
-    # The correct VAA is the azimuth of the line from the pixel to the sensor,
-    # which is perpendicular to the satellite ground track.
-    #
-    # EO-1 orbit
-    # ----------
-    # EO-1 is sun-synchronous, inclination i = 98.7 deg (slightly retrograde).
-    # Standard data are acquired on the DESCENDING node (daytime, flying south).
-    # The ground track azimuth for a descending pass at latitude φ is:
-    #
-    #   For the ascending node (flying north):
-    #       sin(az_asc) = cos(i) / cos(φ)
-    #   For the descending node (flying south):
-    #       az_desc = 180° − arcsin(|cos(i)| / cos(φ))
-    #
-    # Because i > 90°, cos(i) < 0, so the ascending node flies slightly east
-    # of north; the descending node flies slightly east of south.
-    # Example at φ = 62° N, i = 98.7°:
-    #   |cos(98.7°)| / cos(62°) ≈ 0.151 / 0.469 ≈ 0.322
-    #   az_desc ≈ 180° − arcsin(0.322) ≈ 180° − 18.8° ≈ 161° (SSE)
-    #
-    # Cross-track azimuth
-    # -------------------
-    # The sensor looks perpendicular to the track.  The cross-track azimuth
-    # to the east side of the track is az_track + 90° and to the west side
-    # az_track − 90°.  The sign of SENSOR_LOOK_ANGLE selects which side.
-    #
-    # 6S convention
-    # -------------
-    # 6S uses phiv = view azimuth from North, clockwise. Internally it computes
-    # the relative azimuth phi = SAA − VAA, so it is the DIFFERENCE that matters
-    # for path radiance.  Using the physical azimuth of the look direction here
-    # is therefore correct.
+def convert_hyperion(params, log=print):
+    """
+    Convert a Hyperion L1G/T archive to ENVI format.
 
-    EO1_INCLINATION_DEG = 98.7   # EO-1 orbital inclination (retrograde S-S)
+    params keys
+    -----------
+    input_path     : str  — .zip archive or folder containing band GeoTIFFs
+    out_base       : str  — output base path (no extension)
+    interleave     : str  — 'bsq', 'bil', or 'bip'
+    drop_bad_bands : bool — if True (default False), exclude bands where
+                     HYPERION_BBL[i] == 0 from the output cube. The BBL
+                     field in the output ENVI header is updated accordingly.
+    output_type    : str  — 'radiance' (default) or 'toa_reflectance'.
+                     'radiance': store raw DN as int16, nodata=-9999.
+                     'toa_reflectance': convert to TOA reflectance
+                       rho = pi * L / (E0 * cos(SZA)), stored as
+                       round(rho * refl_scale) int16, nodata=-9999.
+                       Requires sza_deg, month, day.
+    refl_scale     : int  — reflectance storage scale (default 10000).
+                     Fractional rho = stored_integer / refl_scale.
+    sza_deg        : float or None — solar zenith angle in degrees.
+                     None (default) means "not provided by user";
+                     the MTL value will be used if available.
+                     0.0 is a valid SZA (sun at zenith).
+    month          : int  — month 1-12 (for Earth-Sun distance).
+    day            : int  — day of month.
+    """
+    import rasterio
+    import spectral.io.envi as envi
 
-    # Scene centre latitude from image corner coordinates
+    input_path  = params["input_path"]
+    out_base    = params["out_base"]
+    interleave  = params["interleave"].lower().strip()
+    drop_bad_bands = params.get("drop_bad_bands", False)
+    output_type    = params.get("output_type", "radiance").lower().strip()
+    refl_scale  = int(params.get("refl_scale", 10000))
+    # Use None as sentinel so we can distinguish "not set" from a genuine SZA of 0
+    _sza_raw = params.get("sza_deg", None)
+    sza_deg  = float(_sza_raw) if _sza_raw is not None else None
+    month       = int(params.get("month", 1))
+    day         = int(params.get("day",   1))
+
+    # ── Unzip or use folder ───────────────────────────────────────────────────
+    tmpdir = None
+    if zipfile.is_zipfile(input_path):
+        log(f"Extracting {os.path.basename(input_path)} ...")
+        tmpdir   = tempfile.mkdtemp(prefix="hyperion_")
+        work_dir = tmpdir
+        with zipfile.ZipFile(input_path) as zf:
+            zf.extractall(tmpdir)
+    elif os.path.isdir(input_path):
+        work_dir = input_path
+        log(f"Input folder: {work_dir}")
+    else:
+        raise ValueError(f"Input must be a .zip file or folder: {input_path}")
+
     try:
-        lat_centre = (float(raw["IMAGE_UL_CORNER_LAT"]) +
-                      float(raw["IMAGE_LL_CORNER_LAT"]) +
-                      float(raw["IMAGE_UR_CORNER_LAT"]) +
-                      float(raw["IMAGE_LR_CORNER_LAT"])) / 4.0
-    except (KeyError, ValueError):
-        lat_centre = 50.0   # fallback if corners absent from MTL
-
-    inc_rad = math.radians(EO1_INCLINATION_DEG)
-    lat_rad = math.radians(lat_centre)
-
-    # Descending pass ground track azimuth
-    ratio = abs(math.cos(inc_rad)) / math.cos(lat_rad)
-    if ratio <= 1.0:
-        az_track = 180.0 - math.degrees(math.asin(ratio))
-    else:
-        az_track = 180.0   # fallback: due south (equator or rounding)
-
-    # Cross-track view azimuth: east = +90 from track, west = -90
-    if look_angle >= 0.0:
-        vaa = (az_track + 90.0) % 360.0   # east-looking
-    else:
-        vaa = (az_track - 90.0) % 360.0   # west-looking
-
-    return dict(
-        acq_date=acq_date, start_time=start_time.strip(),
-        month=dt.month, day=dt.day,
-        sza=sza, saa=saa, vza=vza, vaa=round(vaa, 1),
-        # Legacy fields kept for backward compat; new code uses rad_scale_spec
-        scale_vnir=scale_vnir, scale_swir=scale_swir,
-        rad_scale_spec=f"split:{scale_vnir}:{scale_swir}:70",
-    )
-
-
-def read_hdr(hdr_path):
-    """
-    Parse an ENVI header file (via spectral).
-
-    Returns dict with keys:
-        n_bands, n_lines, n_samples,
-        wl_nm, wl_um, fwhm_nm, bbl, envi_meta
-    """
-    import spectral.io.envi as envi
-    hdr  = envi.open(hdr_path)
-    meta = hdr.metadata
-
-    wl_nm   = np.array([float(w) for w in meta["wavelength"]])
-    fwhm_nm = np.array([float(f) for f in meta["fwhm"]])
-    bbl     = np.array([int(b)   for b in meta["bbl"]])
-
-    return dict(
-        n_bands   = int(meta["bands"]),
-        n_lines   = int(meta["lines"]),
-        n_samples = int(meta["samples"]),
-        wl_nm     = wl_nm,
-        wl_um     = wl_nm / 1000.0,
-        fwhm_nm   = fwhm_nm,
-        bbl       = bbl,
-        envi_meta = meta,
-    )
-
-
-# =============================================================================
-# SECTION 2 -- 6S helpers
-# =============================================================================
-
-def _make_6s_input(wl_um, sza, saa, vza, vaa, month, day,
-                   idatm, uh2o, uo3, iaer, aot550, target_alt_km,
-                   env_model=None, env_radius_km=2.0):
-    """
-    Build a 6S input string for one monochromatic wavelength.
-
-    env_model    : int or None — igrou2 environment surface code (1-4).
-                   None means inhomo=0 (uniform surface, no adjacency).
-    env_radius_km: float — radius of the target patch in km (inhomo=1 only).
-                   6S uses this to weight the adjacency contribution.
-    """
-    atm_extra = f"\n{uh2o:.4f}   {uo3:.4f}" if idatm == 8 else ""
-
-    if env_model is not None:
-        # inhomo=1: target is constant rho=0 (placeholder; we derive rho
-        # from the image), environment is env_model, radius = env_radius_km.
-        # idirec=0 (Lambertian), igroun=0 (constant), rho=0.
-        surface = (
-            f"1\n"                               # inhomo=1
-            f"0 {env_model} {env_radius_km:.2f}\n"  # target env radius
-            f"0\n"                               # idirec=0
-            f"0\n"                               # igroun=0 (constant)
-            f"0.0\n"                             # rho=0 placeholder
-        )
-    else:
-        # inhomo=0: uniform surface
-        surface = "0\n0\n0\n0.0\n"
-
-    return (
-        f"0\n"
-        f"{sza:.4f} {saa:.4f} {vza:.4f} {vaa:.4f} {month} {day}\n"
-        f"{idatm}{atm_extra}\n"
-        f"{iaer}\n"
-        f"0\n"
-        f"{aot550:.4f}\n"
-        f"{-abs(target_alt_km):.4f}\n"
-        f"-1000\n"
-        f"-1\n"
-        f"{wl_um}\n"
-        f"{surface}"
-        f"-2.0\n"
-    )
-
-
-def _coefficients(r6s):
-    """
-    Derive correction coefficients from a 6S result dict.
-
-    Stage-1 correction (uniform surface assumption):
-        rho_s = (rho_toa - xa) / (xb * rho_toa + xc)
-
-    Stage-2 adjacency correction (Tanré et al. 1981, Richter 1990):
-        rho_s2 = rho_s1 + (rho_s1 - rho_env) * f_adj
-        f_adj  = T_dif * S / (1 - S * rho_env)
-    where T_dif = diffuse downward transmittance = sdtott - T_dir,
-          S     = spherical_albedo_tot,
-          rho_env = Gaussian-smoothed Stage-1 reflectance image.
-
-    Returns
-    -------
-    xa, xb, xc        : stage-1 coefficients
-    T_down (sdtott), T_up (sutott), S (spherical_albedo_tot) : needed for Stage-2.
-    T_dir is stored separately in T_dir_arr (ground_direct_fraction * sdtott).
-
-    Note on xa = srotot and the 6S formula:
-        srotot is the path reflectance output from the 6S SOS solver.
-        It equals what the sensor sees over a black surface (rho_s=0).
-        At 427nm, SZA=43.7, AOT=0.06: srotot ~ 0.012 (1.2% path refl).
-
-        This seems low given Rayleigh tau=0.275, but is physically correct:
-        chand(tau_R)=0.135 is the reflectance of a SEMI-INFINITE conservative
-        Rayleigh slab — not the thin real atmosphere over a surface. In the
-        real geometry, most photons transmit directly (T_dir=0.68) and only
-        ~1.2% are backscattered to the sensor. The two quantities are entirely
-        different radiative transfer problems.
-
-        The 6S forward model (verified by fitting) is:
-            rho_toa = xa + T_down*T_up * rho_s / (1 - s_tot * rho_s)
-        where s_tot = spherical_albedo_tot (TOTAL atmospheric spherical albedo).
-        The exact retrieval is then:
-            rho_s = (rho_toa - xa) / (T_d*T_u + s_tot*(rho_toa - xa))
-
-        CRITICAL: s_tot = spherical_albedo_tot (~0.029 at 427nm, AOT=0.06)
-        NOT pizera (~0.90, which is the aerosol-only spherical albedo).
-        Using pizera gives a denominator ~30x too large, causing rho_s to
-        be underestimated by 1-3 pp. Verified: only s_tot gives zero error.
-
-        sroray (Rayleigh component in srotot) is negative in the blue because
-        it is the COUPLING CORRECTION: Rayleigh_in_coupled_atm - Rayleigh_alone.
-        Aerosol forward-scatters photons that would otherwise contribute to
-        Rayleigh backscatter, reducing it. So sroray < 0 in the blue.
-        The total srotot = sroray + sroaer remains small and positive.
-    """
-    rho_atm = r6s["srotot"]
-    T_down  = r6s["sdtott"]
-    T_up    = r6s["sutott"]
-    # CRITICAL: use spherical_albedo_tot (total atmospheric spherical albedo),
-    # NOT pizera. pizera is the aerosol-only spherical albedo (~0.90 in blue).
-    # The correct s in the retrieval formula rho_s=(rho_toa-xa)/(T_d*T_u+s*(rho_toa-xa))
-    # is the TOTAL spherical albedo = spherical_albedo_tot (~0.029 at 427nm, AOT=0.06).
-    # Using pizera causes the denominator to be ~30x too large, severely
-    # underestimating rho_s (by 1-3pp at typical surface reflectances).
-    # Verified by fitting the 6S forward model: rho_toa = xa + T_d*T_u*rho_s/(1-s*rho_s)
-    # gives exact round-trip recovery only with s = spherical_albedo_tot.
-    S       = r6s["spherical_albedo_tot"]
-    denom   = T_down * T_up
-    if denom < 1e-6:
-        return 0.0, 1.0, 0.0, 1.0, 0.0
-    return rho_atm, 1.0 / denom, S / denom, T_down, T_up, S
-
-
-# =============================================================================
-# SECTION 3 -- Main computation
-# =============================================================================
-
-def correct_hyperion(params, log=print):
-    """
-    Full atmospheric correction pipeline.
-
-    params dict keys
-    ----------------
-    File / image info:
-        hdr_file, out_base
-        n_bands, n_lines, n_samples
-        wl_nm, wl_um, fwhm_nm, bbl, envi_meta
-
-    Acquisition geometry (from MTL or supplied directly):
-        acq_date, start_time, month, day   (acq_date/start_time may be "")
-        sza, saa, vza, vaa  [degrees]
-
-    Sensor / calibration:
-        sensor_name   : str — written to output header "sensor type" field
-        input_type    : "radiance"  — apply DN→L→rho_toa chain
-                        "toa_refl" — data already is TOA reflectance; skip E0
-        rad_scale_spec: str — profile rad_scale string, passed to build_rad_scale()
-                        e.g. "split:40:80:70"  or  "uniform:1"  or  "none"
-
-    Atmospheric correction parameters:
-        idatm         [0-8]
-        uh2o          [g/cm2, used only when idatm=8]
-        uo3           [cm-atm, used only when idatm=8]
-        iaer          [0-3]
-        aot550        [AOT at 550 nm]
-        target_alt_km [km above sea level]
-
-    mask_file : str or None (optional)
-        Path to a single-band binary mask image (same spatial extent as input,
-        any dtype; non-zero = valid pixel).  If None, a mask is derived
-        automatically: pixels where ALL bands are zero are treated as nodata.
-
-    log : callable for progress output (default: print)
-    """
-    from sixs.sixs_main import run6S
-    import spectral.io.envi as envi
-
-    # Unpack
-    hdr_file      = params["hdr_file"]
-    out_base      = params["out_base"]
-    acq_date      = params["acq_date"]
-    start_time    = params["start_time"]
-    month, day    = params["month"], params["day"]
-    sza, saa      = params["sza"], params["saa"]
-    vza, vaa      = params["vza"], params["vaa"]
-    sensor_name    = params.get("sensor_name",    "Unknown sensor")
-    input_type     = params.get("input_type",     "radiance")
-    rad_scale_spec = params.get("rad_scale_spec", "uniform:1")
-    # Legacy support: if old scale_vnir/scale_swir keys present, convert
-    if "scale_vnir" in params and "rad_scale_spec" not in params:
-        sv = params["scale_vnir"]; ss = params["scale_swir"]
-        rad_scale_spec = f"split:{sv}:{ss}:70"
-    n_lines       = params["n_lines"]
-    n_samples     = params["n_samples"]
-    n_bands       = params["n_bands"]
-    wl_nm         = params["wl_nm"]
-    wl_um         = params["wl_um"]
-    fwhm_nm       = params["fwhm_nm"]
-    bbl           = params["bbl"].copy()
-    envi_meta     = params["envi_meta"]
-    idatm         = params["idatm"]
-    uh2o          = params["uh2o"]
-    uo3           = params["uo3"]
-    iaer          = params["iaer"]
-    aot550        = params["aot550"]
-    target_alt_km = params["target_alt_km"]
-    env_model      = params.get("env_model",      None)
-    do_adj2        = params.get("do_adj2",        False)
-    adj2_out_base  = params.get("adj2_out_base",  None)
-    adj2_radius_km = params.get("adj2_radius_km", 1.0)
-    pixel_size_m   = params.get("pixel_size_m",   30.0)  # Hyperion GSD = 30 m
-    env_radius_km  = params.get("env_radius_km",  2.0)
-    config_file    = params.get("config_file",    None)
-    spec_csv_file  = params.get("spec_csv_file",  None)
-    interleave     = params.get("interleave",     "bip").lower().strip()
-    drop_bad_bands = params.get("drop_bad_bands", True)
-    mask_file      = params.get("mask_file",      None)
-
-    cos_sza = float(np.cos(np.radians(sza)))
-
-    # -- Print all parameters -------------------------------------------------
-    log("=" * 62)
-    log("  HYPERION 6S ATMOSPHERIC CORRECTION -- PARAMETERS")
-    log("=" * 62)
-    log(f"  Input HDR      : {hdr_file}")
-    log(f"  Output base    : {out_base}")
-    log(f"  Acquisition    : {acq_date}  {start_time}")
-    log(f"  Month / day    : {month} / {day}")
-    log(f"  SZA            : {sza:.3f} deg")
-    log(f"  SAA            : {saa:.3f} deg")
-    log(f"  VZA            : {vza:.3f} deg")
-    log(f"  VAA            : {vaa:.3f} deg")
-    log(f"  cos(SZA)       : {cos_sza:.4f}")
-    log(f"  Sensor         : {sensor_name}")
-    log(f"  Input type     : {input_type}")
-    log(f"  Radiance scale : {rad_scale_spec}")
-    log(f"  Atm model      : idatm = {idatm}")
-    if idatm == 8:
-        log(f"    H2O          : {uh2o:.4f} g/cm2")
-        log(f"    O3           : {uo3:.4f} cm-atm")
-    log(f"  Aerosol model  : iaer = {iaer}")
-    log(f"  AOT @ 550 nm   : {aot550:.4f}")
-    log(f"  Target alt     : {target_alt_km:.3f} km a.s.l.")
-    log(f"  Image size     : {n_lines} x {n_samples} x {n_bands}")
-    env_label = next((k for k, v in ENV_MODELS.items() if v == env_model),
-                     "Uniform (inhomo=0)")
-    log(f"  Environment    : {env_label}" +
-        (f"  radius={env_radius_km:.1f} km" if env_model is not None else ""))
-    log(f"  Mask file      : {mask_file if mask_file else '(auto: all-zero pixels)'}")
-    log(f"  6S config out  : {config_file if config_file else '(not saved)'}")
-    log(f"  Spectral CSV   : {spec_csv_file if spec_csv_file else '(not saved)'}")
-    log(f"  Output interleave: {interleave.upper()}")
-    log(f"  Drop bad bands : {'yes' if drop_bad_bands else 'no'}")
-    if do_adj2:
-        log(f"  Stage-2 adj    : ON  radius={adj2_radius_km:.1f} km  "
-            f"pixel={pixel_size_m:.0f} m  output={adj2_out_base}")
-    else:
-        log(f"  Stage-2 adj    : OFF")
-    log(f"  Good bands     : {bbl.sum()} / {n_bands}")
-    log(f"  Valid wl range : 0.40 - 2.50 um (6S limit)")
-    log("=" * 62)
-
-    # -- 6S per band: correction coefficients --------------------------------
-    xa        = np.zeros(n_bands)
-    xb        = np.ones(n_bands)
-    xc        = np.zeros(n_bands)
-    T_down_arr = np.ones(n_bands)   # sdtott: total downward transmittance
-    T_up_arr   = np.ones(n_bands)   # sutott: total upward transmittance (retained for future use)
-    S_arr      = np.zeros(n_bands)  # spherical_albedo_tot
-    T_dir_arr  = np.ones(n_bands)   # direct-beam downward transmittance (ground_direct_fraction * sdtott)
-
-    # TOA solar irradiance from the 6S built-in solar spectrum (no extra run).
-    # solirr(wl_um) returns W/m2/um at 1 AU; correct for Earth-Sun distance.
-    # Earth is near aphelion in July: (R0/R)^2 slightly below 1.
-    from sixs.utils import solirr as _solirr
-    import datetime as _dt
-    _doy  = _dt.date(2000, month, day).timetuple().tm_yday
-    _B    = 2 * np.pi * (_doy - 1) / 365.0
-    _dsq  = (1.000110 + 0.034221*np.cos(_B) + 0.001280*np.sin(_B)
-             + 0.000719*np.cos(2*_B) + 0.000077*np.sin(2*_B))
-    E0_um = np.array([_solirr(w) * _dsq if 0.25 <= w <= 4.0 else 0.0
-                      for w in wl_um])
-    log(f"  E0 from built-in solar spectrum, Earth-Sun factor = {_dsq:.5f}")
-
-    # Write a single 6S template config file with a wavelength placeholder.
-    # The user can replace FILL_HERE_WAVELENGTH_IN_um with any wavelength
-    # in the valid range (0.40-2.50 um) to re-run 6S for that band manually.
-    # All other parameters are identical for every band.
-    if config_file:
-        template_inp = _make_6s_input(
-            "FILL_HERE_WAVELENGTH_IN_um",
-            sza, saa, vza, vaa, month, day,
-            idatm, uh2o, uo3, iaer, aot550, target_alt_km,
-            env_model=env_model, env_radius_km=env_radius_km,
-        )
-        with open(config_file, "w") as cfg_fh:
-            cfg_fh.write(
-                "# 6S configuration template\n"
-                f"# Scene: {os.path.basename(hdr_file)}\n"
-                f"# Date:  {acq_date}  SZA={sza:.3f} SAA={saa:.3f} "
-                f"VZA={vza:.3f} VAA={vaa:.3f}\n"
-                "# Replace FILL_HERE_WAVELENGTH_IN_um with the band centre\n"
-                "# wavelength in micrometres (e.g. 0.427 for Hyperion band 8)\n"
-                "#\n"
-            )
-            cfg_fh.write(template_inp)
-        log(f"  6S template config written to {config_file}")
-
-    # ── Collect spectral irradiance outputs for CSV ─────────────────────────
-    # The CSV is written after the 6S loop completes (first iteration only).
-    # Columns: wavelength_nm, atm_radiance, env_radiance,
-    #          ground_direct_irr, ground_diffuse_irr, ground_env_irr.
-    # All irradiance values are in W m⁻² µm⁻¹ (band-integrated).
-    # atm_radiance and env_radiance are at the sensor (TOA), W m⁻² sr⁻¹ µm⁻¹.
-    _spec_rows = []   # filled during the 6S loop below
-
-    log(f"\nRunning 6S for {bbl.sum()} good bands...")
-    n_ok = 0
-    for b in range(n_bands):
-        if bbl[b] == 0:
-            continue
-        wl = wl_um[b]
-        if wl < 0.40 or wl > 2.50:
-            bbl[b] = 0
-            continue
-
-        # Atmospheric correction coefficients
-        inp = _make_6s_input(wl, sza, saa, vza, vaa, month, day,
-                             idatm, uh2o, uo3, iaer, aot550, target_alt_km,
-                             env_model=env_model, env_radius_km=env_radius_km)
-        try:
-            r = run6S(io.StringIO(inp), io.StringIO())
-            xa[b], xb[b], xc[b], T_down_arr[b], T_up_arr[b], S_arr[b] = _coefficients(r)
-            # Direct-beam downward transmittance = ground_direct_fraction * sdtott
-            # (ground_direct_fraction = direct/(direct+diffuse) fraction of surface irradiance)
-            T_dir_arr[b] = r.get("ground_direct_fraction", 1.0) * T_down_arr[b]
-            _spec_rows.append((
-                wl_nm[b],
-                r.get("atm_radiance",      float("nan")),
-                r.get("env_radiance",      float("nan")),
-                r.get("ground_direct_irr", float("nan")),
-                r.get("ground_diffuse_irr",float("nan")),
-                r.get("ground_env_irr",    float("nan")),
-            ))
-        except Exception as e:
-            log(f"  Band {b+1} ({wl*1000:.1f} nm): 6S failed -- {e}")
-            bbl[b] = 0
-            continue
-
-        n_ok += 1
-        if n_ok % 10 == 0:
-            log(f"  Band {b+1:3d}/{n_bands}  {wl*1000:7.1f} nm  "
-                f"xa={xa[b]:.4f}  xb={xb[b]:.4f}  xc={xc[b]:.4f}  "
-                f"E0={E0_um[b]:.1f} W/m2/um")
-
-    log(f"\n6S done: {n_ok} bands processed.")
-
-    if spec_csv_file and _spec_rows:
-        try:
-            with open(spec_csv_file, "w") as _csv_fh:
-                _csv_fh.write(
-                    "wavelength_nm,"
-                    "atm_radiance_W_m2_sr_um,"
-                    "env_radiance_W_m2_sr_um,"
-                    "ground_direct_irr_W_m2_um,"
-                    "ground_diffuse_irr_W_m2_um,"
-                    "ground_env_irr_W_m2_um\n"
-                )
-                for row in _spec_rows:
-                    _csv_fh.write(",".join(f"{v:.6g}" for v in row) + "\n")
-            log(f"  Spectral CSV written: {spec_csv_file} ({len(_spec_rows)} bands)")
-        except Exception as _e:
-            log(f"  WARNING: could not write spectral CSV: {_e}")
-
-    # -- Build output header and create output file before computations --------
-    # The output file is created now (allocating disk space) so we can
-    # write each band immediately after correction without holding the
-    # full cube in memory.
-    now_str  = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    atm_desc = (f"idatm={idatm}" +
-                (f" H2O={uh2o}g/cm2 O3={uo3}cm-atm" if idatm == 8 else ""))
-    description = (
-        f"EO-1 Hyperion surface reflectance x10000, 6S correction. "
-        f"Source: {os.path.basename(hdr_file)}. "
-        f"Date: {acq_date} {start_time}. "
-        f"SZA={sza:.2f}deg SAA={saa:.2f}deg VZA={vza:.2f}deg. "
-        f"Atm: {atm_desc} iaer={iaer} AOT550={aot550}. "
-        f"Env: {env_label}"
-        + (f" r={env_radius_km:.1f}km" if env_model is not None else "") + ". "
-        + f"Input: {input_type}  Scale: {rad_scale_spec}. "
-        f"Nodata=-9999. Processed {now_str}."
-    )
-
-    # Build a clean output header — do NOT copy everything from input.
-    # Keep spatial/projection fields; replace content-specific ones.
-    KEEP_KEYS = {
-        "samples", "lines", "bands",
-        "header offset", "file type", "byte order",
-        "x start", "y start",
-        "map info", "coordinate system string",
-        "wavelength units", "wavelength", "fwhm", "bbl",
-    }
-    out_meta = {k: v for k, v in envi_meta.items() if k.lower() in KEEP_KEYS}
-
-    # Determine which bands to write (drop_bad_bands=True by default).
-    if drop_bad_bands:
-        good_idx    = np.where(bbl == 1)[0]
-        out_n_bands = len(good_idx)
-        log(f"  Dropping bad bands: output will have {out_n_bands} / {n_bands} bands")
-    else:
-        good_idx    = np.arange(n_bands)
-        out_n_bands = n_bands
-
-    # Build per-band metadata filtered to the output band subset (good_idx).
-    # Band names reference original band numbers so they remain traceable.
-    wl_nm_all   = [float(w) for w in envi_meta.get("wavelength", [])]
-    fwhm_all    = [float(f) for f in envi_meta.get("fwhm", [])]
-    bbl_all     = [int(b)   for b in envi_meta.get("bbl",  [])]
-
-    band_names_out = [f"B{good_idx[i]+1} ({wl_nm_all[good_idx[i]]:.0f}nm)"
-                      for i in range(out_n_bands)]
-    wl_out   = [wl_nm_all[i] for i in good_idx]
-    fwhm_out = [fwhm_all[i]  for i in good_idx]
-    bbl_out  = [bbl_all[i]   for i in good_idx]
-
-    # Set correct dimensions before create_image allocates the file
-    out_meta["lines"]             = str(n_lines)
-    out_meta["samples"]           = str(n_samples)
-    out_meta["bands"]             = str(out_n_bands)
-    out_meta["description"]       = "{ " + description + " }"
-    out_meta["sensor type"]       = sensor_name
-    out_meta["data type"]         = "2"        # int16
-    out_meta["data ignore value"] = "-9999"
-    out_meta["band names"]        = band_names_out
-    out_meta["wavelength"]        = wl_out
-    out_meta["fwhm"]              = fwhm_out
-    out_meta["bbl"]               = bbl_out
-    out_meta["interleave"]        = interleave
-
-    out_hdr = out_base + ".hdr"
-
-    # Safety check: refuse to overwrite the input file.
-    # Compare resolved absolute paths so symlinks and relative paths
-    # cannot trick us into overwriting the source data.
-    in_base  = os.path.splitext(os.path.abspath(hdr_file))[0]
-    out_base_abs = os.path.abspath(out_base)
-    if out_base_abs == in_base:
-        raise ValueError(
-            f"Output path '{out_base}' is the same as the input file — "
-            "this would overwrite the source data. Choose a different output name."
-        )
-
-    # envi.create_image writes the header and allocates the data file.
-    # open_memmap always returns (lines, samples, bands) — band is last axis.
-    out_img_obj = envi.create_image(out_hdr, out_meta, dtype=np.int16, interleave=interleave, force=True)
-    out_mm = out_img_obj.open_memmap(writable=True)
-    out_mm[:] = -9999
-    out_mm.flush()
-    log(f"Output file created: {out_hdr}  ({out_mm.nbytes/1e6:.1f} MB)")
-
-    # -- Open input via spectral — returns (lines, samples, bands) -----------
-    log("\nOpening input image as read-only memory-map...")
-    in_obj = envi.open(hdr_file)
-    in_mm  = in_obj.open_memmap(writable=False)
-    log(f"  {hdr_file}")
-    log(f"  shape={in_mm.shape}  dtype={in_mm.dtype}")
-
-    # Build per-band radiance scale from the sensor profile spec
-    rad_scale = build_rad_scale(rad_scale_spec, n_bands)
-
-    # -- Build valid-pixel mask (lines x samples, bool) -----------------------
-    if mask_file and os.path.isfile(mask_file):
-        # Load external mask: any non-zero value = valid pixel.
-        # Accept any single-band ENVI file or a raw binary file whose
-        # shape matches the image.
-        try:
-            mask_hdr = mask_file if mask_file.lower().endswith(".hdr")                        else mask_file + ".hdr"
-            if os.path.isfile(mask_hdr):
-                mask_mm = envi.open(mask_hdr).open_memmap(writable=False)
-                # squeeze removes any singleton band dimension for single-band masks
-                valid = np.squeeze(mask_mm).astype(bool)
-                del mask_mm
-            else:
-                log(f"  No .hdr found for mask, skipping.")
-                mask_file = None
-            log(f"  Mask loaded: {valid.sum()} / {valid.size} valid pixels")
-        except Exception as e:
-            log(f"  Mask load failed ({e}), falling back to auto-mask.")
-            mask_file = None
-
-    if not mask_file:
-        # Auto-mask: a pixel is invalid if ALL input bands are zero.
-        log("  Building auto-mask (pixels where all bands are zero)...")
-        # spectral memmap is (lines, samples, bands) -> sum bands on axis 2
-        band_sum = in_mm.astype(np.int32).sum(axis=2)  # -> (lines, samples)
-        valid    = band_sum != 0
-        log(f"  Auto-mask: {valid.sum()} / {valid.size} valid pixels")
-
-    # -- Apply correction band by band, writing directly to output memmap ------
-    log(f"Applying correction to {out_n_bands} bands...")
-    _pct1 = -1
-    for out_b, b in enumerate(good_idx):
-        pct1 = int((out_b + 1) / out_n_bands * 100)
-        if pct1 // 10 > _pct1 // 10:
-            _pct1 = pct1
-            log(f"  {pct1:3d}%  (band {b+1})")
-        # spectral memmap: (lines, samples, bands) — band is last
-        raw = in_mm[:, :, b].astype(np.float32)
-
-        if input_type == "toa_refl":
-            # Data already stores TOA reflectance (e.g. Sentinel-2 L1C)
-            rho_toa = raw / rad_scale[b]   # rad_scale = 1 or a scale factor
+        # ── Find MTL file ─────────────────────────────────────────────────────
+        # Search for MTL: case-insensitive ("MTL" or "mtl" in name or extension)
+        _skip_ext = {".hdr", ".img", ".tif", ".TIF", ".zip"}
+        _raw = (glob.glob(os.path.join(work_dir, "**", "*MTL*"), recursive=True) +
+                glob.glob(os.path.join(work_dir, "**", "*mtl*"), recursive=True))
+        mtl_candidates = sorted({
+            p for p in _raw
+            if os.path.isfile(p)
+            and os.path.splitext(p)[1] not in _skip_ext
+        })
+        if not mtl_candidates:
+            # Graceful: continue without geometry (user must supply SZA manually)
+            log("WARNING: No MTL file found. Acquisition geometry is unknown. "
+                "Enter SZA manually if using toa_reflectance.")
+            mtl_path = None
+            mtl      = {}
+            acq_date = "unknown"
+            start_t  = ""
         else:
-            # Radiance path: DN -> L [W/m2/sr/um] -> rho_toa.
-            # For Hyperion L1GST: rad_scale=40 (VNIR) / 80 (SWIR).
-            # This is DN/400*10 or DN/800*10 (FLAASH->SI: 1 uW/cm2/sr/nm = 10 W/m2/sr/um).
-            # E0 from solirr() is W/m2/um: consistent units, ratio is dimensionless.
-            # 6S uses Wehrli E0 internally; TSIS-1 vs Wehrli <2% difference.
-            L = raw / rad_scale[b]
-            if E0_um[b] < 1e-6:
-                continue
-            rho_toa = (np.pi * L) / (E0_um[b] * cos_sza)
-        rho_toa = np.clip(rho_toa, 0.0, 1.5)
+            mtl_path = mtl_candidates[0]
+            log(f"MTL: {os.path.basename(mtl_path)}")
+            mtl      = parse_mtl(mtl_path)
+            acq_date = mtl.get("ACQUISITION_DATE", "unknown")
+            start_t  = mtl.get("START_TIME", "").strip()
 
-        # Surface reflectance retrieval.
-        #
-        # The 6S forward model (Vermote et al. 1997, eq. 2) is:
-        #   rho_toa = xa + T_up * T_down * rho_s / (1 - S * rho_s)
-        #
-        # Solving exactly for rho_s:
-        #   (rho_toa - xa)(1 - S*rho_s) = T_up * T_down * rho_s
-        #   rho_toa - xa = rho_s * [T_up*T_down + S*(rho_toa - xa)]
-        #   rho_s = (rho_toa - xa) / (T_up*T_down + S*(rho_toa - xa))
-        #
-        # NOTE: The Vermote (1997) eq. 7 approximation:
-        #   rho_s ≈ (rho_toa - xa) / (xb*rho_toa + xc)
-        # where xb = 1/(T_down*T_up) and xc = S*xb, i.e. denominator = (rho_toa+S)/(T_d*T_u),
-        # is NOT the exact inverse of eq. 2. The exact denominator is T_d*T_u + S*(rho_toa-xa),
-        # not (rho_toa+S)/(T_d*T_u). The approximation underestimates rho_s by 1-6 pp
-        # in the blue band at AOT=0.20, growing with rho_s and with S (spherical albedo).
-        # The exact formula is used here instead.
-        #
-        # With xb = 1/(T_d*T_u): denominator = 1/xb + S*(rho_toa - xa)
-        numer = rho_toa - xa[b]
-        denom = (1.0 / xb[b]) + S_arr[b] * numer   # exact: T_d*T_u + S*(rho_toa-xa)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            rho_s = np.where(np.abs(denom) > 1e-6, numer / denom, 0.0)
-        rho_s = np.clip(rho_s, -0.1, 1.5)
+        # Extract sun geometry from MTL for TOA reflectance conversion
+        mtl_sza = mtl_month = mtl_day = None
+        if mtl:
+            try:
+                mtl_sza = round(90.0 - float(mtl["SUN_ELEVATION"]), 3)
+            except (KeyError, ValueError):
+                pass
+            try:
+                import datetime as _dt
+                _d = _dt.date.fromisoformat(acq_date)
+                mtl_month, mtl_day = _d.month, _d.day
+            except (ValueError, TypeError):
+                pass
+            if mtl_sza is not None:
+                log(f"  {acq_date}  SZA={mtl_sza:.3f} deg")
 
-        # Scale to int16, apply mask (nodata=-9999 for invalid pixels)
-        band_out = np.clip(rho_s * 10000, -32768, 32767).astype(np.int16)
-        band_out[~valid] = -9999
+        # ── Find per-band GeoTIFFs ────────────────────────────────────────────
+        tifs = sorted(
+            glob.glob(os.path.join(work_dir, "**", "*.TIF"), recursive=True) +
+            glob.glob(os.path.join(work_dir, "**", "*.tif"), recursive=True))
 
-        # Write directly into output memmap
-        out_mm[:, :, out_b] = band_out   # (lines, samples, bands)
+        band_pat = re.compile(r'_B(\d{3})', re.IGNORECASE)
+        band_files = {}
+        for tf in tifs:
+            m = band_pat.search(os.path.basename(tf))
+            if m:
+                band_files[int(m.group(1))] = tf
 
-    # Flush and close memmaps
-    out_mm.flush()
-    del out_mm
+        n_found = len(band_files)
+        if n_found != EXPECTED_BANDS:
+            log(f"WARNING: found {n_found} band files, expected {EXPECTED_BANDS}!")
+        else:
+            log(f"Found {n_found} band files.")
 
-    def _fmt_val(k, v):
-        """Format a metadata value for the ENVI header.
-        Wavelength / fwhm values are rounded to 2 decimal places (nm resolution
-        is more than sufficient for 10-nm Hyperion bands).
-        Lists/tuples are written as {a, b, c, ...}.
-        """
-        if isinstance(v, (list, tuple)):
-            key_lower = k.lower()
-            if key_lower in ("wavelength", "fwhm"):
-                # Round to 2 decimal places — sub-nm precision is meaningless
-                items = ", ".join(f"{float(x):.2f}" for x in v)
-            elif key_lower == "band names":
-                items = ", ".join(str(x) for x in v)
-            else:
-                items = ", ".join(str(x) for x in v)
-            return f"{k} = {{{items}}}"
-        return f"{k} = {v}"
+        bands_sorted = sorted(band_files.keys())
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # STAGE 2 — Adjacency correction
-    # ══════════════════════════════════════════════════════════════════════════
-    # The atmospheric adjacency effect arises because diffuse upwelling photons
-    # originating from the surroundings are rescattered by the atmosphere toward
-    # the sensor, mixing a fraction of the environment signal into every pixel.
-    #
-    # Physical model (Tanré et al. 1981, Richter 1990):
-    #   rho_toa = xa + T_dir * T_up * rho_s / (1 - S*rho_s)
-    #           + T_dif * T_up * rho_env / (1 - S*rho_env)
-    # where T_dir = direct-beam downward transmittance,
-    #       T_dif = diffuse downward transmittance  (sdtott - T_dir),
-    #       T_up  = total upward transmittance (sutott),
-    #       S     = spherical albedo (spherical_albedo_tot),
-    #       rho_env = spatially averaged environment reflectance (PSF-weighted).
-    #
-    # Stage-1 used the simplified model (T_dir + T_dif = T_d = sdtott):
-    #   rho_toa = xa + T_d * T_up * rho_s1 / (1 - S*rho_s1)
-    # which assumes rho_env = rho_s1 everywhere.
-    #
-    # The adjacency correction adjusts for the actual rho_env:
-    #   rho_s2 ≈ rho_s1 + (rho_s1 - rho_env) * f_adj
-    # where:
-    #   f_adj = T_dif * S / (1 - S * rho_env)   [Richter 1990, eq. 3]
-    #
-    # For AOT=0.06 at 427nm: T_dif≈0.20, S≈0.20, f_adj≈0.04
-    # Effect at a contrasting border (rho_s1=0.02, rho_env=0.40): ~−1.5 pp.
-    # Effect grows with AOT (higher aerosol → more diffuse scattering → larger T_dif).
-    #
-    # Gaussian sigma: the PSF of the atmosphere integrates to ~e-folding scale
-    # l = H_atm / (tau_R + tau_aer) ≈ 8km/0.33 ≈ 24km for clean blue sky.
-    # In practice a radius of 0.5-2 km captures the dominant adjacency contribution.
-    if do_adj2 and adj2_out_base:
-        from scipy.ndimage import gaussian_filter
-        log(f"\nStage-2 adjacency correction  radius={adj2_radius_km:.1f} km ...")
+        # Build output band list (0-based indices into bands_sorted/BBL)
+        if drop_bad_bands:
+            out_band_idx = [i for i, bnum in enumerate(bands_sorted)
+                            if i < len(HYPERION_BBL) and HYPERION_BBL[i] == 1]
+            log(f"  drop_bad_bands: keeping {len(out_band_idx)} / {n_found} good bands")
+        else:
+            out_band_idx = list(range(len(bands_sorted)))
 
-        sigma = (adj2_radius_km * 1000.0) / pixel_size_m
-        log(f"  Gaussian sigma = {sigma:.1f} pixels  "
-            f"({adj2_radius_km:.1f} km / {pixel_size_m:.0f} m pixel)")
+        # ── Image dimensions from first band ──────────────────────────────────
+        with rasterio.open(band_files[bands_sorted[0]]) as src:
+            n_lines, n_samples = src.height, src.width
+            transform = src.transform
+            crs       = src.crs
 
-        # Create Stage-2 output file
-        # Safety: refuse to overwrite input or Stage-1 output
-        if os.path.abspath(adj2_out_base) in (in_base, out_base_abs):
-            raise ValueError(
-                f"Stage-2 output path '{adj2_out_base}' conflicts with "
-                "input or Stage-1 output — choose a different name."
+        n_out = len(out_band_idx)   # bands actually written to output
+        log(f"Size: {n_lines} lines × {n_samples} samples × {n_found} bands "
+            f"({n_out} written)")
+
+        # ── Per-band E0 for TOA reflectance conversion ─────────────────────────
+        # The 6S TSIS-1 solar spectrum is used (solirr, W/m2/um at 1 AU).
+        # Earth-Sun distance is corrected via varsol() (Spencer 1971).
+        # Radiance scaling: VNIR bands 1-70 = DN/40, SWIR 71-242 = DN/80.
+        E0_band      = None
+        rad_scale_arr= None
+        cos_sza      = 1.0
+        if output_type == "toa_reflectance":
+            try:
+                import sys as _sys
+                import importlib, pathlib
+                # Find sixs package — expected one level up from this file
+                _here = pathlib.Path(__file__).resolve().parent
+                for _candidate in [_here.parent, _here, _here.parent.parent]:
+                    _pkg = _candidate / "sixs_python"
+                    if _pkg.is_dir():
+                        _sys.path.insert(0, str(_pkg)); break
+                from sixs.utils import solirr, varsol
+            except ImportError:
+                # Try direct import (sixs already on sys.path)
+                try:
+                    from sixs.utils import solirr, varsol
+                except ImportError as _e:
+                    raise ImportError(
+                        "Cannot import sixs.utils — ensure sixs_python is on "
+                        "sys.path or installed. Cannot compute TOA reflectance."
+                    ) from _e
+            # Prefer geometry from MTL; fall back to user-supplied values.
+            # Priority: MTL > user-supplied > error
+            eff_sza   = mtl_sza   if mtl_sza   is not None else sza_deg
+            eff_month = mtl_month if mtl_month is not None else month
+            eff_day   = mtl_day   if mtl_day   is not None else day
+            if eff_sza is None:
+                raise ValueError(
+                    "SZA not available: no MTL found and no value entered manually.")
+            # Warn if user entered a value that differs from the MTL
+            if mtl_sza is not None and sza_deg is not None and abs(mtl_sza - sza_deg) > 0.5:
+                log(f"  Note: using SZA from MTL ({mtl_sza:.3f} deg); "
+                    f"manually entered value was {sza_deg:.1f} deg.")
+            sza_deg = eff_sza   # update for logging and header
+            cos_sza = np.cos(np.radians(eff_sza))
+            if cos_sza < 0.01:
+                raise ValueError(
+                    f"SZA={eff_sza:.1f} deg: sun is below or near horizon.")
+            dsol = varsol(eff_day, eff_month)
+            # E0 per band at actual Earth-Sun distance [W/m2/um]
+            E0_band = np.array(
+                [solirr(HYPERION_WL_NM[i] / 1000.0) * dsol
+                 for i in range(n_found)], dtype=np.float64)
+            # Radiance scale: 1-based band number <= 70 -> VNIR, else SWIR
+            rad_scale_arr = np.where(
+                np.arange(1, n_found + 1) <= 70, 40.0, 80.0)
+            log(f"  SZA={sza_deg:.2f} deg  cos(SZA)={cos_sza:.4f}  "
+                f"dsol={dsol:.5f}")
+            log(f"  Solar spectrum: TSIS-1 HSRS (Coddington et al. 2021)")
+            log(f"  Reflectance scale: x{refl_scale}  "
+                f"(stored_int / {refl_scale} = fractional rho)")
+
+        # ── ENVI metadata ─────────────────────────────────────────────────────
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        if output_type == "toa_reflectance":
+            description = (
+                f"EO-1 Hyperion L1T TOA reflectance x{refl_scale}. "
+                f"Acquisition: {acq_date}  {start_t}. "
+                f"Converted: {now_str}. "
+                f"Source: {os.path.basename(input_path)}. "
+                f"Bands: {n_found}. SZA={sza_deg:.3f} deg. "
+                f"Solar spectrum: TSIS-1 HSRS (Coddington et al. 2021). "
+                f"L: VNIR=DN/40, SWIR=DN/80 W/m2/sr/um. "
+                f"rho=pi*L/(E0*cos(SZA)), stored=round(rho*{refl_scale}). "
+                f"Nodata=-9999."
             )
-        adj2_hdr = adj2_out_base + ".hdr"
-        adj2_meta = dict(out_meta)
-        adj2_meta["description"] = (
-            "{ Stage-2 adjacency-corrected surface reflectance x10000. "
-            f"Gaussian radius={adj2_radius_km:.1f} km ({sigma:.1f} px). "
-            + out_meta["description"][2:]  # reuse stage-1 description
-        )
-        adj2_img_obj = envi.create_image(adj2_hdr, adj2_meta, dtype=np.int16, interleave=interleave, force=True)
-        adj2_mm = adj2_img_obj.open_memmap(writable=True)
-        adj2_mm[:] = -9999
+        else:
+            description = (
+                f"EO-1 Hyperion L1T radiance cube. "
+                f"Acquisition: {acq_date}  {start_t}. "
+                f"Converted to ENVI: {now_str}. "
+                f"Source: {os.path.basename(input_path)}. "
+                f"Bands: {n_found}. "
+                f"Radiance: DN/40=W/m2/sr/um (VNIR), DN/80=W/m2/sr/um (SWIR). "
+                f"Nodata=-9999 (all-zero pixels)."
+            )
 
-        # Re-open Stage-1 output as read source via spectral
-        s1_obj = envi.open(out_hdr)
-        s1_mm  = s1_obj.open_memmap(writable=False)
+        # UTM map info from rasterio geotransform and CRS.
+        # ENVI map info format:
+        #   {UTM, tie_x, tie_y, easting, northing, pixel_x, pixel_y,
+        #    zone, hemisphere, datum, units=Meters}
+        # tie_x/tie_y = pixel coordinate of the tie point (1,1 = upper-left corner).
+        # easting/northing = map coordinates of that tie point (transform.c, transform.f).
+        # pixel_x/pixel_y = pixel size in map units (always positive).
+        map_info = None
+        if transform and crs and crs.is_projected:
+            # Extract UTM zone from EPSG code (326xx = UTM North, 327xx = UTM South)
+            # or fall back to parsing the CRS WKT/Proj4 string.
+            zone, hem = None, None
+            if crs.to_epsg():
+                epsg = crs.to_epsg()
+                if 32601 <= epsg <= 32660:
+                    zone, hem = epsg - 32600, "North"
+                elif 32701 <= epsg <= 32760:
+                    zone, hem = epsg - 32700, "South"
+            if zone is None:
+                # Fallback: search CRS string for zone number
+                zone_m = re.search(r'(?:zone|utm)[_\s]*(\d+)',
+                                   str(crs), re.IGNORECASE)
+                if zone_m:
+                    zone = int(zone_m.group(1))
+                    # Hemisphere from northing: southern if False Northing = 10000000
+                    hem = "South" if "10000000" in str(crs) else "North"
 
-        log(f"  Smoothing and correcting {out_n_bands} bands...")
-        _pct2 = -1
-        for out_b, b in enumerate(good_idx):
-            pct2 = int((out_b + 1) / out_n_bands * 100)
-            if pct2 // 10 > _pct2 // 10:
-                _pct2 = pct2
-                log(f"    {pct2:3d}%  (band {b+1})")
-            if T_down_arr[b] < 1e-4:
-                continue
+            if zone:
+                map_info = (
+                    f"{{UTM, 1.000, 1.000, "
+                    f"{transform.c:.3f}, {transform.f:.3f}, "
+                    f"{abs(transform.a):.10e}, {abs(transform.e):.10e}, "
+                    f"{zone}, {hem}, WGS-84, units=Meters}}"
+                )
+            else:
+                # Non-UTM projected CRS: write what we can
+                map_info = (
+                    f"{{Arbitrary, 1.000, 1.000, "
+                    f"{transform.c:.3f}, {transform.f:.3f}, "
+                    f"{abs(transform.a):.10e}, {abs(transform.e):.10e}}}"
+                )
 
-            # Stage-1 reflectance for this band (float, nodata=NaN)
-            rho_s1 = s1_mm[:, :, out_b].astype(np.float32) / 10000.0
-            rho_s1[rho_s1 < -0.09] = np.nan     # mask nodata
+        envi_meta = {
+            "description":       "{ " + description + " }",
+            "samples":           str(n_samples),
+            "lines":             str(n_lines),
+            "bands":             str(n_out),
+            "header offset":     "0",
+            "file type":         "ENVI Standard",
+            "data type":         "2",          # int16
+            "interleave":        interleave,
+            "sensor type":       "EO-1 Hyperion",
+            "byte order":        "0",
+            "data ignore value": "-9999",
+            "reflectance scale": str(refl_scale) if output_type == "toa_reflectance" else None,
+            "wavelength units":  "Nanometers",
+            "wavelength":        [f"{HYPERION_WL_NM[i]:.2f}" for i in out_band_idx],
+            "fwhm":              [f"{HYPERION_FWHM_NM[i]:.4f}" for i in out_band_idx],
+            "bbl":               [str(HYPERION_BBL[i])          for i in out_band_idx],
+            "band names":        [BAND_NAMES[i]                 for i in out_band_idx],
+        }
+        if map_info:
+            envi_meta["map info"] = map_info
 
-            # Environmental reflectance = spatially smoothed Stage-1
-            # NaN pixels are replaced by local mean before smoothing
-            fill = np.where(np.isnan(rho_s1),
-                            np.nanmean(rho_s1), rho_s1)
-            rho_env = gaussian_filter(fill.astype(np.float64), sigma=sigma
-                                       ).astype(np.float32)
+        # ── Safety: do not overwrite the input file itself ────────────────────
+        # The output is always an ENVI pair (out_base.hdr + out_base.img/bsq/…),
+        # so using the same stem as the input ZIP is fine — the extensions differ.
+        # Only raise if out_base exactly matches an existing non-ENVI file that
+        # could be silently clobbered (e.g. if input_path has no extension).
+        if (os.path.abspath(out_base) == os.path.abspath(input_path)
+                or os.path.abspath(out_base + ".zip") == os.path.abspath(input_path)):
+            raise ValueError(
+                "Output path would overwrite the input file — choose a different name.")
 
-            # Adjacency correction — Tanré et al. (1981), Richter (1990):
-            #
-            #   rho_s2 = rho_s1 + (rho_s1 - rho_env) * f_adj
-            #   f_adj  = T_dif * S / (1 - S * rho_env)
-            #
-            # T_dif = sdtott - T_dir  (diffuse downward transmittance)
-            # T_dir = ground_direct_fraction * sdtott  (stored in T_dir_arr)
-            # S     = spherical_albedo_tot             (stored in S_arr)
-            #
-            # f_adj is the fraction of the environment signal that leaks into
-            # the pixel via atmospheric diffuse rescattering.  Its magnitude
-            # grows with aerosol load (larger T_dif) and spherical albedo.
-            # For AOT=0.06 at 427 nm: T_dif≈0.19, S≈0.20, f_adj≈0.04
-            # → effect of ~1.5 pp at a dark/bright border (Δrho_env=0.38).
+        # ── Create output ENVI file ───────────────────────────────────────────
+        # Remove any metadata fields set to None (conditional on output_type)
+        envi_meta = {k: v for k, v in envi_meta.items() if v is not None}
+        out_hdr = out_base + ".hdr"
+        log(f"\nCreating output: {out_hdr}")
+        out_obj = envi.create_image(out_hdr, envi_meta,
+                                     dtype=np.int16, interleave=interleave,
+                                     force=True)
+        out_mm = out_obj.open_memmap(writable=True)
+        out_mm[:] = -9999
+        out_mm.flush()
+        log(f"  {out_mm.nbytes/1e6:.1f} MB allocated  ({interleave.upper()})")
 
-            _Td  = T_down_arr[b]   # sdtott
-            _S   = S_arr[b]        # spherical_albedo_tot
-            _Tdir = T_dir_arr[b]
-            _Tdif = _Td - _Tdir   # diffuse downward transmittance
+        # ── Read bands, convert if needed, and write ──────────────────────────
+        mode_str = "TOA reflectance" if output_type == "toa_reflectance" else "radiance"
+        log(f"Writing {n_out} bands ({mode_str})...")
+        _pct_logged = -1
+        for out_b, src_b in enumerate(out_band_idx):
+            band_num = bands_sorted[src_b]
+            with rasterio.open(band_files[band_num]) as src_r:
+                dn = src_r.read(1).astype(np.float32)  # (lines, samples)
 
-            with np.errstate(divide="ignore", invalid="ignore"):
-                f_adj = np.where(
-                    np.abs(1.0 - _S * rho_env) > 1e-6,
-                    _Tdif * _S / (1.0 - _S * rho_env),
-                    0.0)
+            if output_type == "toa_reflectance" and E0_band is not None:
+                # DN -> radiance [W/m2/sr/um]; use src_b to index into full-242 arrays
+                L = dn / rad_scale_arr[src_b]
+                # Radiance -> TOA reflectance (dimensionless)
+                # Both L and E0 are in W/m2/um so the ratio is dimensionless.
+                E0 = E0_band[src_b]
+                rho = (np.pi * L) / (E0 * cos_sza) if E0 > 1e-6 else np.zeros_like(L)
+                rho = np.clip(rho, 0.0, 1.5)
+                band_data = np.clip(rho * refl_scale, -32768, 32767).astype(np.int16)
+            else:
+                # Radiance mode: store DN unchanged
+                band_data = dn.astype(np.int16)
 
-            rho_s2 = rho_s1 + (rho_s1 - rho_env) * f_adj
-            rho_s2 = np.clip(rho_s2, -0.1, 1.5)
+            out_mm[:, :, out_b] = band_data
+            pct = int((out_b + 1) / n_out * 100)
+            if pct // 10 > _pct_logged // 10:
+                _pct_logged = pct
+                log(f"  {pct:3d}%  (band {band_num}/{bands_sorted[-1]})")
+        log("  Done.")
+        out_mm.flush()
 
-            # Restore nodata mask and write
-            band_out = np.clip(rho_s2 * 10000, -32768, 32767).astype(np.int16)
-            band_out[np.isnan(rho_s1)] = -9999
-            band_out[~valid] = -9999
-            adj2_mm[:, :, out_b] = band_out
+        # ── Valid-pixel mask ──────────────────────────────────────────────────
+        log("\nBuilding valid-pixel mask (all-zero pixels = fill)...")
+        band_sum = np.zeros((n_lines, n_samples), dtype=np.int32)
+        for out_b in range(n_out):
+            band_sum += np.abs(out_mm[:, :, out_b].astype(np.int32))
+        valid = (band_sum > 0)
+        log(f"  Valid: {valid.sum()}  Fill: {(~valid).sum()}")
 
-        log("    100%  done.")
-        adj2_mm.flush()
-        del adj2_mm, s1_mm
+        # Apply nodata to fill pixels
+        for out_b in range(n_out):
+            tmp = out_mm[:, :, out_b].copy()
+            tmp[~valid] = -9999
+            out_mm[:, :, out_b] = tmp
+        out_mm.flush()
+        del out_mm
 
-        # Write Stage-2 header with correct dimensions
-        adj2_meta["lines"]   = str(n_lines)
-        adj2_meta["samples"] = str(n_samples)
-        adj2_meta["bands"]   = str(out_n_bands)
-        with open(adj2_hdr, "w") as _f:
-            _f.write("ENVI\n")
-            for k, v in adj2_meta.items():
-                _f.write(_fmt_val(k, v) + "\n")
+        # ── Mask file ─────────────────────────────────────────────────────────
+        mask_hdr  = out_base + "_mask.hdr"
+        mask_meta = {
+            "description":   (f"{{ EO-1 Hyperion valid-pixel mask. "
+                               f"1=valid 0=fill (all-zero DN). "
+                               f"Image bands: {n_out} ({'BBL-filtered' if drop_bad_bands else 'all'}). "
+                               f"Source: {os.path.basename(input_path)}. "
+                               f"Converted: {now_str}. }}"),
+            "samples":       str(n_samples),
+            "lines":         str(n_lines),
+            "bands":         "1",
+            "header offset": "0",
+            "file type":     "ENVI Standard",
+            "data type":     "2",
+            "interleave":    "bsq",
+            "sensor type":   "EO-1 Hyperion",
+            "byte order":    "0",
+        }
+        if map_info:
+            mask_meta["map info"] = map_info
 
-        log(f"  Stage-2 output: {adj2_hdr}")
+        log(f"Writing mask: {mask_hdr}")
+        mask_obj = envi.create_image(mask_hdr, mask_meta,
+                                      dtype=np.int16, interleave="bsq",
+                                      force=True)
+        mask_mm = mask_obj.open_memmap(writable=True)
+        mask_mm[:, :, 0] = valid.astype(np.int16)
+        mask_mm.flush()
+        del mask_mm
 
-    del in_mm
+        # ── Copy MTL ──────────────────────────────────────────────────────────
+        out_dir  = os.path.dirname(os.path.abspath(out_base))
+        if mtl_path:
+            mtl_ext  = os.path.splitext(mtl_path)[1]
+            scene_id = os.path.splitext(os.path.basename(mtl_path))[0]
+            mtl_dest = os.path.join(out_dir, scene_id + "_MTL" + mtl_ext)
+            shutil.copy2(mtl_path, mtl_dest)
+            log(f"MTL copied: {os.path.basename(mtl_dest)}")
+        else:
+            log("  (No MTL file to copy.)")
 
-    log("  100%  done.")
-    log(f"\nOutput written: {out_hdr}")
-    log(f"\nDescription:\n  {description}")
-    return out_hdr
+        log(f"\nDone.")
+        log(f"  Image : {out_hdr}")
+        log(f"  Mask  : {mask_hdr}")
+        log(f"  MTL   : {mtl_dest}")
+        return out_hdr
+
+    finally:
+        if tmpdir and os.path.isdir(tmpdir):
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # =============================================================================
-# SECTION 4 -- Tk GUI
+# SECTION 3 — GUI
 # =============================================================================
 
 def run_gui():
@@ -1055,21 +559,13 @@ def run_gui():
     from tkinter import ttk, filedialog
 
     root = tk.Tk()
-    root.title("Hyperion 6S Atmospheric Correction")
-    root.geometry("800x680")
+    root.title("Hyperion L1G/T → ENVI Converter")
+    root.geometry("760x560")
     root.protocol("WM_DELETE_WINDOW", lambda: (root.quit(), root.destroy()))
 
-    # ------------------------------------------------------------------
-    # All user-editable fields are plain Entry widgets stored in a dict.
-    # We never rely on tk.StringVar / tk.DoubleVar so Spyder's reuse of
-    # the Tk root cannot silently break the bindings.
-    # Read  : e[key].get()
-    # Write : _set(key, value)
-    # ------------------------------------------------------------------
-    e = {}   # key -> Entry or Combobox widget
+    e = {}
 
     def _set(key, value):
-        """Write value into widget, works for Entry and Combobox."""
         w = e[key]
         if isinstance(w, ttk.Combobox):
             w.set(str(value))
@@ -1077,528 +573,259 @@ def run_gui():
             w.delete(0, tk.END)
             w.insert(0, str(value))
 
-    def _get(key, typ=str):
-        try:
-            return typ(e[key].get())
-        except (ValueError, KeyError):
-            return typ()
+    def _get(key):
+        return e[key].get()
 
-    def _entry(parent, key, default, width=14, **grid_kw):
-        """Create an Entry, pre-fill it, store in e[key], grid it."""
-        w = ttk.Entry(parent, width=width)
-        w.insert(0, str(default))
-        w.grid(**grid_kw)
-        e[key] = w
-        return w
-
-    def _combo(parent, key, values, default, width=30, **grid_kw):
-        """Create a readonly Combobox, store in e[key], grid it."""
-        w = ttk.Combobox(parent, values=values, state="readonly", width=width)
-        w.set(default)
-        w.grid(**grid_kw)
-        e[key] = w
-        return w
-
-    # ── status bar ────────────────────────────────────────────────────
     status_lbl = ttk.Label(root, text="Ready.", anchor=tk.W, relief=tk.SUNKEN)
     status_lbl.pack(side=tk.BOTTOM, fill=tk.X)
 
-    def set_status(msg):
-        status_lbl.config(text=msg)
-
-    # ── button bar ────────────────────────────────────────────────────
     btn_bar = ttk.Frame(root)
     btn_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=4)
 
-    # ── notebook ──────────────────────────────────────────────────────
     nb = ttk.Notebook(root)
     nb.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
 
-    # ═══════════════════════════════════════════════
-    # TAB 1 — Files & Geometry (scrollable — content may exceed window height)
-    # ═══════════════════════════════════════════════
-    _tab1_outer = ttk.Frame(nb)
-    nb.add(_tab1_outer, text="Files & Geometry")
+    # ── Files tab ─────────────────────────────────────────────────────────────
+    tab1 = ttk.Frame(nb, padding=10)
+    nb.add(tab1, text="Files")
 
-    _t1_canvas = tk.Canvas(_tab1_outer, borderwidth=0, highlightthickness=0)
-    _t1_scroll = ttk.Scrollbar(_tab1_outer, orient=tk.VERTICAL,
-                                command=_t1_canvas.yview)
-    _t1_canvas.configure(yscrollcommand=_t1_scroll.set)
-    _t1_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-    _t1_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-    tab1 = ttk.Frame(_t1_canvas, padding=10)
-    _t1_win = _t1_canvas.create_window((0, 0), window=tab1, anchor="nw")
-
-    def _t1_resize(event):
-        _t1_canvas.configure(scrollregion=_t1_canvas.bbox("all"))
-    tab1.bind("<Configure>", _t1_resize)
-    _t1_canvas.bind("<Configure>",
-        lambda e: _t1_canvas.itemconfig(_t1_win, width=e.width))
-    _t1_canvas.bind_all("<MouseWheel>",
-        lambda e: _t1_canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
-
-    # Files frame
-    fg = ttk.LabelFrame(tab1, text="Files", padding=6)
+    fg = ttk.LabelFrame(tab1, text="Input / Output", padding=8)
     fg.pack(fill=tk.X, pady=(0, 10))
     fg.columnconfigure(1, weight=1)
 
-    def _file_row(parent, row, label, key, cmd, hint=None):
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W, pady=3)
-        w = ttk.Entry(parent)
-        w.grid(row=row, column=1, sticky=tk.EW, padx=4)
-        e[key] = w
-        if cmd:
-            ttk.Button(parent, text="Browse...", command=cmd).grid(row=row, column=2)
-        elif hint:
-            ttk.Label(parent, text=hint, foreground="gray").grid(
-                row=row, column=2, sticky=tk.W)
-
-    def browse_hdr():
-        p = filedialog.askopenfilename(
-            title="Select ENVI header (.hdr)",
-            filetypes=[("HDR files", "*.hdr"), ("All files", "*.*")])
-        if p:
-            _set("hdr_file", p)
-            if not _get("out_base"):
-                _set("out_base", os.path.splitext(p)[0] + "_6S")
-            # Pre-fill Stage-2 output name
-            _set("adj2_out_base", os.path.splitext(p)[0] + "_6Sadj")
-
-    def browse_mtl():
-        p = filedialog.askopenfilename(
-            title="Select Hyperion MTL file",
-            filetypes=[("L1T files", "*.L1T"), ("TXT files", "*.txt"),
-                       ("All files", "*.*")])
-        if not p:
-            return
-        _set("mtl_file", p)
+    def _peek_mtl(zip_path):
+        """Read SZA/date from MTL inside a zip without full extraction."""
         try:
-            m = read_mtl(p)
-            _set("sza",        round(m["sza"], 3))
-            _set("saa",        round(m["saa"], 3))
-            _set("vza",        round(m["vza"], 3))
-            _set("vaa",        round(m["vaa"], 3))
-            _set("month",      m["month"])
-            _set("day",        m["day"])
-            # Update rad_scale_spec if profile still matches Hyperion defaults
-            _set("rad_scale_spec", m["rad_scale_spec"])
-            set_status(
-                f"MTL loaded: {m['acq_date']}  "
-                f"SZA={m['sza']:.2f}  VZA={m['vza']:.2f}")
-        except Exception as ex:
-            set_status(f"MTL error: {ex}")
+            with zipfile.ZipFile(zip_path) as zf:
+                candidates = [n for n in zf.namelist()
+                              if "mtl" in os.path.basename(n).lower()
+                              and not n.endswith((".hdr",".img",".tif",".TIF"))]
+                if not candidates:
+                    return {}
+                with zf.open(candidates[0]) as fh:
+                    text = fh.read().decode("utf-8", errors="replace")
+            meta = {}
+            for line in text.splitlines():
+                m = re.match(r'\s+(\w+)\s*=\s*"?([^"\n]+)"?\s*$', line)
+                if m:
+                    meta[m.group(1)] = m.group(2).strip()
+            result = {}
+            if "SUN_ELEVATION" in meta:
+                result["sza"] = round(90.0 - float(meta["SUN_ELEVATION"]), 3)
+            if "ACQUISITION_DATE" in meta:
+                import datetime as _dt3
+                _d = _dt3.date.fromisoformat(meta["ACQUISITION_DATE"])
+                result["month"] = _d.month
+                result["day"]   = _d.day
+            return result
+        except Exception:
+            return {}
 
-    def browse_mask():
+    def browse_input():
         p = filedialog.askopenfilename(
-            title="Select mask file (optional)",
-            filetypes=[("ENVI HDR", "*.hdr"), ("All files", "*.*")])
+            title="Select Hyperion ZIP archive",
+            filetypes=[("ZIP", "*.zip"), ("All", "*.*")])
+        if not p:
+            p = filedialog.askdirectory(title="Or select folder with band GeoTIFFs")
         if p:
-            _set("mask_file", p)
+            _set("input_path", p)
+            base = os.path.splitext(p)[0]
+            _set("out_base", base + "_ENVI")
+            # Auto-fill geometry from MTL inside the zip
+            geo = _peek_mtl(p) if zipfile.is_zipfile(p) else {}
+            if geo:
+                # Temporarily enable the fields so _set() can write into them,
+                # then restore whatever state on_type_change() would set.
+                for w in (sza_entry, month_entry, day_entry):
+                    w.config(state=tk.NORMAL)
+                if "sza"   in geo: _set("sza_deg", geo["sza"])
+                if "month" in geo: _set("month",   geo["month"])
+                if "day"   in geo: _set("day",     geo["day"])
+                # Re-apply the correct enabled/disabled state for current type
+                on_type_change()
+                status_lbl.config(
+                    text=f"Input: {os.path.basename(p)}  "
+                         f"SZA={geo.get('sza','?')} deg  "
+                         f"{geo.get('month','?')}/{geo.get('day','?')}")
+            else:
+                status_lbl.config(
+                    text=f"Input: {os.path.basename(p)}  (no MTL found)")
 
-    _file_row(fg, 0, "HDR file:",           "hdr_file",  browse_hdr)
-    _file_row(fg, 1, "MTL file:",           "mtl_file",  browse_mtl)
-    _file_row(fg, 2, "Output 1st stage:",   "out_base",  None)
-
-    # Stage-2 output row — enable/disable controlled by adj2_cb below
-    ttk.Label(fg, text="Output 2nd stage:").grid(row=3, column=0, sticky=tk.W, pady=3)
-    adj2_out_e = ttk.Entry(fg)
-    adj2_out_e.grid(row=3, column=1, sticky=tk.EW, padx=4)
-    e["adj2_out_base"] = adj2_out_e
-
-    def browse_adj2_out():
-        hdr_base = _get("hdr_file")
-        init = os.path.splitext(hdr_base)[0] + "_6Sadj" if hdr_base else ""
+    def browse_out():
         p = filedialog.asksaveasfilename(
-            title="Stage-2 output base name (no extension)",
-            initialfile=os.path.basename(init),
-            initialdir=os.path.dirname(init) if init else ".")
+            title="Output base name (no extension)")
         if p:
-            _set("adj2_out_base", p)
+            _set("out_base", p)
 
-    adj2_browse_btn = ttk.Button(fg, text="Browse...", command=browse_adj2_out)
-    adj2_browse_btn.grid(row=3, column=2)
-
-    _file_row(fg, 4, "Mask (optional):",   "mask_file", browse_mask,
-              "(empty = auto from zero pixels)")
-
-    def browse_config():
-        p = filedialog.asksaveasfilename(
-            title="Save 6S config file as",
-            defaultextension=".txt",
-            filetypes=[("Text", "*.txt"), ("All", "*.*")])
-        if p:
-            config_entry.config(state=tk.NORMAL)
-            _set("config_file", p)
-
-    ttk.Label(fg, text="Save 6S config:").grid(row=5, column=0, sticky=tk.W, pady=3)
-    config_entry = ttk.Entry(fg)
-    config_entry.insert(0, "<not saved>")
-    config_entry.config(state=tk.DISABLED)
-    config_entry.grid(row=5, column=1, sticky=tk.EW, padx=4)
-    e["config_file"] = config_entry
-    ttk.Button(fg, text="Browse...", command=browse_config).grid(row=5, column=2)
-
-    def browse_spec_csv():
-        p = filedialog.asksaveasfilename(
-            title="Save spectral irradiance CSV as",
-            defaultextension=".csv",
-            filetypes=[("CSV", "*.csv"), ("All", "*.*")])
-        if p:
-            spec_csv_entry.config(state=tk.NORMAL)
-            _set("spec_csv_file", p)
-
-    ttk.Label(fg, text="Save spectral CSV:").grid(row=6, column=0, sticky=tk.W, pady=3)
-    spec_csv_entry = ttk.Entry(fg)
-    spec_csv_entry.insert(0, "<not saved>")
-    spec_csv_entry.config(state=tk.DISABLED)
-    spec_csv_entry.grid(row=6, column=1, sticky=tk.EW, padx=4)
-    e["spec_csv_file"] = spec_csv_entry
-    ttk.Button(fg, text="Browse...", command=browse_spec_csv).grid(row=6, column=2)
-    ttk.Label(fg,
-              text="atm/env radiance + ground direct/diffuse/env irradiance, W m⁻² µm⁻¹",
-              foreground="gray").grid(row=7, column=0, columnspan=3, sticky=tk.W)
-
-    # ── Checkboxes ──────────────────────────────────────────────────────────
-    # All tk variable types (BooleanVar, IntVar) can show an indeterminate
-    # visual state in Spyder because Spyder reuses the Tk root between runs,
-    # leaving stale traces on variable names.
-    # Solution: do NOT bind a variable at all. Instead manage the state
-    # entirely through the widget's own .state() / .instate() API and
-    # store the boolean in a plain Python list so there is nothing for
-    # Tk to get confused about.
-
-    # Exclude bad bands — on by default
-    _drop = [True]   # mutable container; _drop[0] is the current value
-
-    def _drop_toggle():
-        _drop[0] = not _drop[0]
-        drop_cb.state(["!alternate", "selected"] if _drop[0] else ["!alternate", "!selected"])
-
-    drop_cb = ttk.Checkbutton(fg,
-                               text="Exclude bad bands from output  (saves disk space)",
-                               command=_drop_toggle)
-    drop_cb.grid(row=8, column=0, columnspan=3, sticky=tk.W, pady=(6, 2))
-    drop_cb.state(["!alternate", "selected"])   # clear alternate, set ticked
-
-    # Enable Stage-2 adjacency correction — on by default
-    _adj2 = [True]
-
-    def on_adj2_toggle():
-        _adj2[0] = not _adj2[0]
-        adj2_cb.state(["!alternate", "selected"] if _adj2[0] else ["!alternate", "!selected"])
-        state = tk.NORMAL if _adj2[0] else tk.DISABLED
-        adj2_out_e.config(state=state)
-        adj2_browse_btn.config(state=state)
-
-    adj2_cb = ttk.Checkbutton(fg,
-                               text="Enable Stage-2 adjacency correction",
-                               command=on_adj2_toggle)
-    adj2_cb.grid(row=9, column=0, columnspan=3, sticky=tk.W, pady=(0, 4))
-    adj2_cb.state(["!alternate", "selected"])   # clear alternate, set ticked
-
-    # Apply initial enable state (Stage-2 on -> fields active)
-    adj2_out_e.config(state=tk.NORMAL)
-    adj2_browse_btn.config(state=tk.NORMAL)
-
-    # Output file interleave
-    il_frame = ttk.LabelFrame(tab1, text="Output file interleave", padding=6)
-    il_frame.pack(fill=tk.X, pady=(6, 0))
-
-    ttk.Label(il_frame, text="Interleave:").grid(row=0, column=0, sticky=tk.W)
-    il_cb = _combo(il_frame, "interleave",
-                   ["bip", "bil", "bsq"], "bip",
-                   width=8, row=0, column=1, sticky=tk.W, padx=6)
-    ttk.Label(il_frame,
-              text="BIP = pixel (best for spectral access)  "
-                   "BIL = line  BSQ = band",
-              foreground="gray").grid(row=0, column=2, sticky=tk.W)
-
-    # Geometry frame — all values must come from the MTL file.
-    # Only VAA defaults to 0 (Hyperion pushbroom flies along-track).
-    gg = ttk.LabelFrame(tab1, text="Geometry  (auto-filled from MTL)", padding=8)
-    gg.pack(fill=tk.X, pady=(0, 6))
-    for r, (lbl, key, default) in enumerate([
-        ("Solar zenith SZA (deg):", "sza",   ""),   # no default: load from MTL
-        ("Solar azimuth SAA (deg):", "saa",  ""),   # no default: load from MTL
-        ("View zenith VZA (deg):",  "vza",   ""),   # no default: load from MTL
-        ("View azimuth VAA (deg):", "vaa",    0.0), # 0 is correct for pushbroom
-        ("Month:",                  "month",  ""),  # no default: load from MTL
-        ("Day:",                    "day",    ""),  # no default: load from MTL
+    for r, (lbl, key, cmd) in enumerate([
+        ("Input ZIP / folder:", "input_path", browse_input),
+        ("Output base:",        "out_base",   browse_out),
     ]):
-        ttk.Label(gg, text=lbl).grid(row=r, column=0, sticky=tk.W, pady=1)
-        _entry(gg, key, default, width=12, row=r, column=1, sticky=tk.W, padx=6)
+        ttk.Label(fg, text=lbl).grid(row=r, column=0, sticky=tk.W, pady=3)
+        entry = ttk.Entry(fg)
+        entry.grid(row=r, column=1, sticky=tk.EW, padx=4)
+        e[key] = entry
+        ttk.Button(fg, text="Browse...", command=cmd).grid(row=r, column=2)
 
-    # Sensor profile selector + per-sensor fields
-    sg = ttk.LabelFrame(tab1, text="Sensor", padding=6)
-    sg.pack(fill=tk.X, pady=(0, 6))
-    sg.columnconfigure(1, weight=1)
+    # Output type and interleave
+    og = ttk.LabelFrame(tab1, text="Output options", padding=8)
+    og.pack(fill=tk.X, pady=(0, 6))
 
-    ttk.Label(sg, text="Sensor profile:").grid(row=0, column=0, sticky=tk.W, pady=2)
-    profile_cb = _combo(sg, "sensor_profile",
-                        list(SENSOR_PROFILES.keys()), DEFAULT_PROFILE,
-                        width=28, row=0, column=1, sticky=tk.W, padx=6)
-    ttk.Label(sg, text="(adding sensors requires modifying SENSOR_PROFILES in the code)",
+    # Output type: radiance or TOA reflectance
+    ttk.Label(og, text="Output type:").grid(row=0, column=0, sticky=tk.W, pady=3)
+    type_cb = ttk.Combobox(og,
+                            values=["radiance", "toa_reflectance"],
+                            state="readonly", width=18)
+    type_cb.set("radiance")
+    type_cb.grid(row=0, column=1, sticky=tk.W, padx=6)
+    e["output_type"] = type_cb
+    ttk.Label(og,
+              text="radiance = raw DN  |  toa_reflectance = rho, needs SZA",
               foreground="gray").grid(row=0, column=2, sticky=tk.W)
 
-    ttk.Label(sg, text="Sensor name (in header):").grid(row=1, column=0, sticky=tk.W, pady=2)
-    _entry(sg, "sensor_name", SENSOR_PROFILES[DEFAULT_PROFILE]["sensor_type"],
-           width=28, row=1, column=1, sticky=tk.W, padx=6)
-
-    ttk.Label(sg, text="Input type:").grid(row=2, column=0, sticky=tk.W, pady=2)
-    _combo(sg, "input_type",
-           ["radiance", "toa_refl"], "radiance",
-           width=14, row=2, column=1, sticky=tk.W, padx=6)
-    ttk.Label(sg, text="radiance: DN→L→ρ_toa→ρ_s   toa_refl: skip L and E0 steps",
-              foreground="gray").grid(row=2, column=2, sticky=tk.W)
-
-    ttk.Label(sg, text="Radiance scale:").grid(row=3, column=0, sticky=tk.W, pady=2)
-    _entry(sg, "rad_scale_spec",
-           SENSOR_PROFILES[DEFAULT_PROFILE]["rad_scale"],
-           width=20, row=3, column=1, sticky=tk.W, padx=6)
-    ttk.Label(sg, text='e.g. "split:40:80:70"  "uniform:1"  "none"',
-              foreground="gray").grid(row=3, column=2, sticky=tk.W)
-
-    def on_profile_change(*_):
-        """Fill sensor fields from the selected profile."""
-        name = _get("sensor_profile")
-        if name not in SENSOR_PROFILES:
-            return
-        p = SENSOR_PROFILES[name]
-        _set("sensor_name",    p["sensor_type"])
-        _set("input_type",     p["input_type"])
-        _set("rad_scale_spec", p["rad_scale"])
-        _set("pixel_size_m",   p["pixel_size_m"])
-        # VAA: if orbit_eo1, restore computed value; if manual, leave as-is
-        if p["vaa_source"] == "manual":
-            _set("vaa", 0.0)
-
-    profile_cb.bind("<<ComboboxSelected>>", on_profile_change)
-
-    # ═══════════════════════════════════════════════
-    # TAB 2 — Atmosphere
-    # ═══════════════════════════════════════════════
-    tab2 = ttk.Frame(nb, padding=10)
-    nb.add(tab2, text="Atmosphere")
-
-    # Atmospheric profile
-    ag = ttk.LabelFrame(tab2, text="Atmospheric profile", padding=8)
-    ag.pack(fill=tk.X, pady=(0, 10))
-
-    ttk.Label(ag, text="Profile:").grid(row=0, column=0, sticky=tk.W, pady=3)
-    atm_cb = _combo(ag, "idatm_name", list(ATM_MODELS.keys()), DEFAULT_ATM,
-                    width=32, row=0, column=1, sticky=tk.W, padx=6)
-
-    ttk.Label(ag, text="H2O (g/cm2):").grid(row=1, column=0, sticky=tk.W, pady=3)
-    h2o_entry = _entry(ag, "uh2o", 1.75, width=10, row=1, column=1,
-                        sticky=tk.W, padx=6)
-    ttk.Label(ag, text="only for idatm=8",
+    # SZA field — enabled only when toa_reflectance is selected
+    ttk.Label(og, text="SZA (deg):").grid(row=1, column=0, sticky=tk.W, pady=3)
+    sza_entry = ttk.Entry(og, width=10)
+    sza_entry.insert(0, "")
+    sza_entry.grid(row=1, column=1, sticky=tk.W, padx=6)
+    e["sza_deg"] = sza_entry
+    ttk.Label(og,
+              text="solar zenith angle — auto-filled from MTL if available",
               foreground="gray").grid(row=1, column=2, sticky=tk.W)
 
-    ttk.Label(ag, text="O3 (cm-atm):").grid(row=2, column=0, sticky=tk.W, pady=3)
-    o3_entry = _entry(ag, "uo3", 0.35, width=10, row=2, column=1,
-                       sticky=tk.W, padx=6)
-    ttk.Label(ag, text="only for idatm=8",
-              foreground="gray").grid(row=2, column=2, sticky=tk.W)
+    ttk.Label(og, text="Month:").grid(row=2, column=0, sticky=tk.W, pady=3)
+    month_entry = ttk.Entry(og, width=6)
+    month_entry.insert(0, "")
+    month_entry.grid(row=2, column=1, sticky=tk.W, padx=6)
+    e["month"] = month_entry
 
-    def on_atm_change(*_):
-        is_user = ATM_MODELS.get(e["idatm_name"].get(), 0) == 8
-        state = tk.NORMAL if is_user else tk.DISABLED
-        h2o_entry.config(state=state)
-        o3_entry.config(state=state)
+    ttk.Label(og, text="Day:").grid(row=3, column=0, sticky=tk.W, pady=3)
+    day_entry = ttk.Entry(og, width=6)
+    day_entry.insert(0, "")
+    day_entry.grid(row=3, column=1, sticky=tk.W, padx=6)
+    e["day"] = day_entry
 
-    atm_cb.bind("<<ComboboxSelected>>", on_atm_change)
-    on_atm_change()   # set initial state
+    ttk.Label(og, text="Refl. scale:").grid(row=4, column=0, sticky=tk.W, pady=3)
+    scale_entry = ttk.Entry(og, width=10)
+    scale_entry.insert(0, "10000")
+    scale_entry.grid(row=4, column=1, sticky=tk.W, padx=6)
+    e["refl_scale"] = scale_entry
+    ttk.Label(og, text="stored_int / scale = fractional reflectance",
+              foreground="gray").grid(row=4, column=2, sticky=tk.W)
 
-    # Aerosol
-    aerg = ttk.LabelFrame(tab2, text="Aerosol", padding=8)
-    aerg.pack(fill=tk.X, pady=(0, 10))
+    def on_type_change(*_):
+        """Enable SZA/month/day only when toa_reflectance is selected."""
+        is_refl = type_cb.get() == "toa_reflectance"
+        state = tk.NORMAL if is_refl else tk.DISABLED
+        for w in (sza_entry, month_entry, day_entry):
+            w.config(state=state)
 
-    ttk.Label(aerg, text="Model:").grid(row=0, column=0, sticky=tk.W, pady=3)
-    _combo(aerg, "iaer_name", list(AEROSOL_MODELS.keys()), DEFAULT_AER,
-           width=25, row=0, column=1, sticky=tk.W, padx=6)
+    type_cb.bind("<<ComboboxSelected>>", on_type_change)
+    on_type_change()   # apply initial state
 
-    ttk.Label(aerg, text="AOT @ 550 nm:").grid(row=1, column=0, sticky=tk.W, pady=3)
-    _entry(aerg, "aot550", 0.06, width=10, row=1, column=1, sticky=tk.W, padx=6)
+    # Interleave selector
+    ig = ttk.LabelFrame(tab1, text="Output interleave", padding=8)
+    ig.pack(fill=tk.X)
+    ttk.Label(ig, text="Interleave:").grid(row=0, column=0, sticky=tk.W)
+    il_cb = ttk.Combobox(ig, values=["bsq","bil","bip"],
+                          state="readonly", width=8)
+    il_cb.set("bsq")
+    il_cb.grid(row=0, column=1, sticky=tk.W, padx=6)
+    e["interleave"] = il_cb
+    ttk.Label(ig,
+              text="BSQ = band sequential (default)  "
+                   "BIL = by line  BIP = by pixel",
+              foreground="gray").grid(row=0, column=2, sticky=tk.W)
 
-    # Target
-    tg = ttk.LabelFrame(tab2, text="Target", padding=8)
-    tg.pack(fill=tk.X, pady=(0, 10))
-    ttk.Label(tg, text="Altitude (km a.s.l.):").grid(row=0, column=0, sticky=tk.W)
-    _entry(tg, "target_alt_km", 0.20, width=10, row=0, column=1,
-            sticky=tk.W, padx=6)
+    # Bad-band exclusion
+    bg = ttk.LabelFrame(tab1, text="Band selection", padding=8)
+    bg.pack(fill=tk.X, pady=(6, 0))
+    drop_var = tk.BooleanVar(value=False)
+    ttk.Checkbutton(bg, text="Exclude bad bands (BBL = 0)",
+                    variable=drop_var).grid(row=0, column=0, sticky=tk.W)
+    ttk.Label(bg,
+              text=f"  ({sum(1 for b in HYPERION_BBL if b==0)} bands excluded: "
+                   f"bands 1-7, 58-76, 225-242)",
+              foreground="gray").grid(row=0, column=1, sticky=tk.W)
+    e["drop_bad_bands"] = drop_var
 
-    # Adjacency / environment
-    envg = ttk.LabelFrame(tab2, text="Adjacency correction (inhomo)", padding=8)
-    envg.pack(fill=tk.X)
-
-    ttk.Label(envg, text="Environment type:").grid(row=0, column=0, sticky=tk.W, pady=3)
-    _combo(envg, "env_model_name", list(ENV_MODELS.keys()), DEFAULT_ENV,
-           width=32, row=0, column=1, sticky=tk.W, padx=6, columnspan=2)
-
-    ttk.Label(envg, text="Patch radius (km):").grid(row=1, column=0, sticky=tk.W, pady=3)
-    _entry(envg, "env_radius_km", DEFAULT_ENV_RADIUS_KM, width=10,
-           row=1, column=1, sticky=tk.W, padx=6)
-    ttk.Label(envg, text="radius of uniform target patch",
-              foreground="gray").grid(row=1, column=2, sticky=tk.W)
-
-    # ── Stage-2 adjacency correction ─────────────────────────────────────────
-    # Parameters are here (Atmosphere tab) because they describe the atmospheric
-    # smoothing kernel; the output file name is in Files & Geometry tab.
-    adj2g = ttk.LabelFrame(tab2, text="Stage-2 adjacency correction", padding=8)
-    adj2g.pack(fill=tk.X, pady=(8, 0))
-    adj2g.columnconfigure(1, weight=1)
-
-    # Smoothing radius
-    ttk.Label(adj2g, text="Smoothing radius (km):").grid(row=0, column=0, sticky=tk.W, pady=2)
-    adj2_radius_e = ttk.Entry(adj2g, width=10)
-    adj2_radius_e.insert(0, "1.0")
-    adj2_radius_e.grid(row=0, column=1, sticky=tk.W, padx=4)
-    e["adj2_radius_km"] = adj2_radius_e
-    ttk.Label(adj2g, text="Gaussian kernel radius for rho_env estimate",
-              foreground="gray").grid(row=0, column=2, columnspan=2, sticky=tk.W)
-
-    # Pixel size
-    ttk.Label(adj2g, text="Pixel size (m):").grid(row=1, column=0, sticky=tk.W, pady=2)
-    adj2_pixel_e = ttk.Entry(adj2g, width=10)
-    adj2_pixel_e.insert(0, "30")
-    adj2_pixel_e.grid(row=1, column=1, sticky=tk.W, padx=4)
-    e["pixel_size_m"] = adj2_pixel_e
-    ttk.Label(adj2g, text="Hyperion GSD = 30 m",
-              foreground="gray").grid(row=1, column=2, sticky=tk.W)
-
-    # ═══════════════════════════════════════════════
-    # TAB 3 — Log
-    # ═══════════════════════════════════════════════
-    tab3 = ttk.Frame(nb, padding=4)
-    nb.add(tab3, text="Log")
-    log_text = tk.Text(tab3, font=("Courier", 9), wrap=tk.NONE)
+    # ── Log tab ───────────────────────────────────────────────────────────────
+    tab2 = ttk.Frame(nb, padding=4)
+    nb.add(tab2, text="Log")
+    log_text = tk.Text(tab2, font=("Courier", 9), wrap=tk.NONE)
     log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-    ttk.Scrollbar(tab3, orient=tk.VERTICAL,
+    ttk.Scrollbar(tab2, orient=tk.VERTICAL,
                   command=log_text.yview).pack(side=tk.RIGHT, fill=tk.Y)
 
-    # ── Run button ────────────────────────────────────────────────────
-    def run_correction():
+    # ── Run / Close ───────────────────────────────────────────────────────────
+    def run_conversion():
         run_btn.config(state=tk.DISABLED)
         log_text.delete("1.0", tk.END)
-        nb.select(tab3)
-        set_status("Running...")
+        nb.select(tab2)
+        status_lbl.config(text="Converting...")
         root.update()
 
-        hdr_path = _get("hdr_file")
-        if not hdr_path or not os.path.isfile(hdr_path):
-            set_status("Error: HDR file not found.")
+        inp = _get("input_path")
+        if not inp or not os.path.exists(inp):
+            status_lbl.config(text="Error: input not found.")
             run_btn.config(state=tk.NORMAL)
             return
 
-        try:
-            hdr_data = read_hdr(hdr_path)
-        except Exception as ex:
-            set_status(f"HDR error: {ex}")
-            run_btn.config(state=tk.NORMAL)
-            return
-
-        mask_path = _get("mask_file") or None
-        if mask_path and not os.path.isfile(mask_path):
-            mask_path = None
-
-        params = dict(
-            hdr_file      = hdr_path,
-            out_base      = _get("out_base") or os.path.splitext(hdr_path)[0] + "_6S",
-            acq_date      = f"{_get('month')}/{_get('day')}",
-            start_time    = "",
-            month         = _get("month", int),
-            day           = _get("day",   int),
-            sza           = _get("sza",   float),
-            saa           = _get("saa",   float),
-            vza           = _get("vza",   float),
-            vaa           = _get("vaa",   float),
-            sensor_name    = _get("sensor_name"),
-            input_type     = _get("input_type"),
-            rad_scale_spec = _get("rad_scale_spec"),
-            idatm         = ATM_MODELS.get(_get("idatm_name"), 2),
-            uh2o          = _get("uh2o",          float),
-            uo3           = _get("uo3",            float),
-            iaer          = AEROSOL_MODELS.get(_get("iaer_name"), 1),
-            aot550        = _get("aot550",         float),
-            target_alt_km = _get("target_alt_km",  float),
-            mask_file     = mask_path,
-            config_file   = (_get("config_file") or None)
-                            if _get("config_file") not in ("", "<not saved>") else None,
-            spec_csv_file = (_get("spec_csv_file") or None)
-                            if _get("spec_csv_file") not in ("", "<not saved>") else None,
-            interleave      = _get("interleave") or "bip",
-            drop_bad_bands  = _drop[0],
-            do_adj2         = _adj2[0],
-            adj2_out_base   = (_get("adj2_out_base") or None) if _adj2[0] else None,
-            adj2_radius_km  = _get("adj2_radius_km", float),
-            pixel_size_m    = _get("pixel_size_m",   float),
-            env_model       = ENV_MODELS.get(_get("env_model_name"), None),
-            env_radius_km = _get("env_radius_km", float),
-            **{k: hdr_data[k] for k in
-               ["n_bands","n_lines","n_samples","wl_nm","wl_um","fwhm_nm",
-                "bbl","envi_meta"]},
-        )
+        out_type = _get("output_type") or "radiance"
+        params = {
+            "input_path":  inp,
+            "out_base":    _get("out_base") or os.path.splitext(inp)[0]+"_ENVI",
+            "interleave":  _get("interleave") or "bsq",
+            "drop_bad_bands": e["drop_bad_bands"].get(),
+            "output_type": out_type,
+            "refl_scale":  int(_get("refl_scale") or 10000),
+            "sza_deg":     float(_get("sza_deg")) if _get("sza_deg").strip() else None,
+            "month":       int(_get("month") or 1),
+            "day":         int(_get("day")   or 1),
+        }
 
         def log(msg, end="\n"):
-            # end= is ignored in the GUI — always appends a new line.
+            # Always append a new line — no in-place overwriting.
+            # The end= argument is accepted for compatibility with script mode
+            # but treated as a newline in the GUI to avoid widget corruption.
             log_text.insert(tk.END, msg + "\n")
             log_text.see(tk.END)
             root.update()
 
         try:
-            out_hdr = correct_hyperion(params, log=log)
-            set_status(f"Done -> {os.path.basename(out_hdr)}")
+            out_hdr = convert_hyperion(params, log=log)
+            status_lbl.config(text=f"Done → {os.path.basename(out_hdr)}")
         except Exception as ex:
             import traceback
             log(traceback.format_exc())
-            set_status(f"Error: {ex}")
+            status_lbl.config(text=f"Error: {ex}")
         finally:
             run_btn.config(state=tk.NORMAL)
 
-    run_btn = ttk.Button(btn_bar, text="Run correction", command=run_correction)
-    run_btn.pack(side=tk.LEFT, padx=(0, 6))
+    run_btn = ttk.Button(btn_bar, text="▶  Convert", command=run_conversion)
+    run_btn.pack(side=tk.LEFT, padx=(0,6))
     ttk.Button(btn_bar, text="Close",
                command=lambda: (root.quit(), root.destroy())).pack(side=tk.LEFT)
 
     root.mainloop()
 
+
 # =============================================================================
-# SECTION 5 -- Entry point
+# SECTION 4 — Entry point
 # =============================================================================
 
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1:
-        # Script mode: hyperspectral_correct.py file.hdr [file.L1T]
-        hdr_path = sys.argv[1]
-        mtl_path = sys.argv[2] if len(sys.argv) > 2 else None
-        base     = os.path.splitext(hdr_path)[0]
-
-        mtl_data = read_mtl(mtl_path) if mtl_path else dict(
-            acq_date="unknown", start_time="",
-            month=7, day=3,
-            sza=43.7, saa=139.1, vza=18.6, vaa=0.0,
-            sensor_name="EO-1 Hyperion",
-        input_type="radiance",
-        rad_scale_spec="split:40:80:70",
-            n_lines=0, n_samples=0,
-        )
-        hdr_data = read_hdr(hdr_path)
-
-        params = dict(
-            hdr_file=hdr_path,
-            out_base=base + "_6S",
-            idatm=2, uh2o=1.75, uo3=0.35,
-            iaer=1,  aot550=0.06, target_alt_km=0.20,
-        mask_file=None, config_file=None, interleave="bip", drop_bad_bands=True,
-        do_adj2=False, adj2_out_base=None, adj2_radius_km=1.0,
-        pixel_size_m=30.0,
-        env_model=None,  env_radius_km=2.0,
-            **mtl_data,
-            **{k: hdr_data[k] for k in
-               ["n_bands","wl_nm","wl_um","fwhm_nm","bbl","envi_meta"]},
-        )
-        correct_hyperion(params)
+        convert_hyperion({
+            "input_path":  sys.argv[1],
+            "out_base":    sys.argv[2] if len(sys.argv)>2
+                           else os.path.splitext(sys.argv[1])[0]+"_ENVI",
+            "interleave":  sys.argv[3] if len(sys.argv)>3 else "bsq",
+            "output_type": sys.argv[4] if len(sys.argv)>4 else "radiance",
+            "sza_deg":     float(sys.argv[5]) if len(sys.argv)>5 else None,
+            "month":       int(sys.argv[6])   if len(sys.argv)>6 else 1,
+            "day":         int(sys.argv[7])   if len(sys.argv)>7 else 1,
+        })
     else:
         run_gui()
