@@ -88,7 +88,7 @@ def _setup_gauss(mu, mu2, np_):
     return rm, gb, np.array(rp), np.array(gp)
 
 
-def run6S(input_stream=None, output_stream=None):
+def run6S(input_stream=None, output_stream=None, n_harmonics: int = 3):
     """
     Run the 6S radiative transfer model.
 
@@ -96,6 +96,10 @@ def run6S(input_stream=None, output_stream=None):
     ----------
     input_stream  : file-like or None – source of input parameters (default: stdin)
     output_stream : file-like or None – destination for output (default: stdout)
+    n_harmonics   : int, default 3
+        Number of Fourier azimuth harmonics in the SOS solver (iborm = n-1).
+        3 = exact for Rayleigh, <0.02% error for continental AOT<0.5.
+        Increase to 6-10 for high AOT or strongly asymmetric aerosols.
 
     Returns
     -------
@@ -173,6 +177,10 @@ def run6S(input_stream=None, output_stream=None):
         _opened = True
     if output_stream is None:
         output_stream = sys.stdout
+
+    # Configure the SOS Fourier harmonic count before any RT computation
+    from .os_module import set_n_harmonics
+    set_n_harmonics(n_harmonics)
 
     def read(*args):
         """Read next non-blank, non-comment line and return parsed values.

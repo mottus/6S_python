@@ -207,6 +207,57 @@ def build_rad_scale(profile_rad_scale, n_bands):
 # Values can also be supplied directly to correct_hyperion() without file I/O.
 # =============================================================================
 
+def find_mtl(hdr_path):
+    """
+    Search for an MTL/metadata file alongside an ENVI HDR, without assuming
+    any particular extension.
+
+    Strategy (in order):
+      1. Look in the same directory as hdr_path for any file whose name
+         contains "MTL" or "mtl" (case-insensitive).
+      2. Among candidates, prefer files that actually contain the key
+         ACQUISITION_DATE (confirming it is a valid Hyperion MTL).
+      3. Return the best match, or None if nothing is found.
+    """
+    import os
+    hdr_dir  = os.path.dirname(os.path.abspath(hdr_path))
+    stem     = os.path.splitext(os.path.basename(hdr_path))[0]
+
+    # Collect all files in the same directory
+    try:
+        siblings = os.listdir(hdr_dir)
+    except OSError:
+        return None
+
+    # Priority 1: files whose name contains "MTL" (case-insensitive)
+    mtl_candidates = [
+        os.path.join(hdr_dir, f) for f in siblings
+        if "mtl" in f.lower() and os.path.isfile(os.path.join(hdr_dir, f))
+    ]
+
+    # Priority 2: if no MTL-named files, try every text-like file and check content
+    if not mtl_candidates:
+        text_exts = {".txt", ".l1t", ".l1g", ".met", ".xml", ""}
+        mtl_candidates = [
+            os.path.join(hdr_dir, f) for f in siblings
+            if os.path.splitext(f)[1].lower() in text_exts
+            and os.path.isfile(os.path.join(hdr_dir, f))
+        ]
+
+    # Among candidates, prefer those containing ACQUISITION_DATE
+    for path in mtl_candidates:
+        try:
+            with open(path, errors="ignore") as fh:
+                head = fh.read(4096)
+            if "ACQUISITION_DATE" in head:
+                return path
+        except OSError:
+            continue
+
+    # Fall back to first MTL-named candidate even without content check
+    return mtl_candidates[0] if mtl_candidates else None
+
+
 def read_mtl(mtl_path):
     """
     Parse an EO-1 Hyperion L1T MTL file.
@@ -493,6 +544,9 @@ def correct_hyperion(params, log=print):
         iaer          [0-3]
         aot550        [AOT at 550 nm]
         target_alt_km [km above sea level]
+        n_harmonics   [int, default 3 — Fourier azimuth harmonics for SOS;
+                       3 = exact for Rayleigh, <0.02% error for AOT<0.5;
+                       increase to 6-10 for heavy aerosol or asymmetric phase fn]
 
     mask_file : str or None (optional)
         Path to a single-band binary mask image (same spatial extent as input,
@@ -541,6 +595,7 @@ def correct_hyperion(params, log=print):
     env_radius_km  = params.get("env_radius_km",  2.0)
     config_file    = params.get("config_file",    None)
     spec_csv_file  = params.get("spec_csv_file",  None)
+    n_harmonics    = int(params.get("n_harmonics", 3))
     interleave     = params.get("interleave",     "bip").lower().strip()
     drop_bad_bands = params.get("drop_bad_bands", True)
     mask_file      = params.get("mask_file",      None)
@@ -578,6 +633,7 @@ def correct_hyperion(params, log=print):
     log(f"  Mask file      : {mask_file if mask_file else '(auto: all-zero pixels)'}")
     log(f"  6S config out  : {config_file if config_file else '(not saved)'}")
     log(f"  Spectral CSV   : {spec_csv_file if spec_csv_file else '(not saved)'}")
+    log(f"  SOS harmonics  : {n_harmonics}")
     log(f"  Output interleave: {interleave.upper()}")
     log(f"  Drop bad bands : {'yes' if drop_bad_bands else 'no'}")
     if do_adj2:
@@ -658,7 +714,7 @@ def correct_hyperion(params, log=print):
                              idatm, uh2o, uo3, iaer, aot550, target_alt_km,
                              env_model=env_model, env_radius_km=env_radius_km)
         try:
-            r = run6S(io.StringIO(inp), io.StringIO())
+            r = run6S(io.StringIO(inp), io.StringIO(), n_harmonics=n_harmonics)
             xa[b], xb[b], xc[b], T_down_arr[b], T_up_arr[b], S_arr[b] = _coefficients(r)
             # Direct-beam downward transmittance = ground_direct_fraction * sdtott
             # (ground_direct_fraction = direct/(direct+diffuse) fraction of surface irradiance)
@@ -1164,12 +1220,30 @@ def run_gui():
                 _set("out_base", os.path.splitext(p)[0] + "_6S")
             # Pre-fill Stage-2 output name
             _set("adj2_out_base", os.path.splitext(p)[0] + "_6Sadj")
+            # Auto-detect MTL if not already set
+            if not _get("mtl_file"):
+                found = find_mtl(p)
+                if found:
+                    _set("mtl_file", found)
+                    try:
+                        m = read_mtl(found)
+                        _set("sza",   round(m["sza"], 3))
+                        _set("saa",   round(m["saa"], 3))
+                        _set("vza",   round(m["vza"], 3))
+                        _set("vaa",   round(m["vaa"], 3))
+                        _set("month", m["month"])
+                        _set("day",   m["day"])
+                        _set("rad_scale_spec", m["rad_scale_spec"])
+                        set_status(
+                            f"MTL auto-detected: {os.path.basename(found)}  "
+                            f"SZA={m['sza']:.2f}  VZA={m['vza']:.2f}")
+                    except Exception:
+                        pass  # silently ignore auto-detect parse errors
 
     def browse_mtl():
         p = filedialog.askopenfilename(
             title="Select Hyperion MTL file",
-            filetypes=[("L1T files", "*.L1T"), ("TXT files", "*.txt"),
-                       ("All files", "*.*")])
+            filetypes=[("All files", "*.*")])
         if not p:
             return
         _set("mtl_file", p)
