@@ -205,7 +205,7 @@ def print_error(tex):
 # the Hyperion spectral range, well within other calibration uncertainties.
 # The correction formula is self-consistent regardless of which E0 is used,
 # as long as the same E0 is used for both rho_toa computation and E0_band
-# in the hyperion_atm_correction script.
+# in the hyperspectral_correct script.
 #
 # ── 6S srotot is NOT the total path reflectance ───────────────────────────
 # This is a common source of confusion. In the 6S coupled SOS solver:

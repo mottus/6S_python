@@ -1,14 +1,14 @@
 """
-hyperion_atm_correction.py
+hyperspectral_correct.py
 --------------------------
 Atmospheric correction of EO-1 Hyperion L1T hyperspectral imagery using 6S
 (Second Simulation of the Satellite Signal in the Solar Spectrum).
 
 Usage
 -----
-  GUI    : python hyperion_atm_correction.py
-  Script : python hyperion_atm_correction.py file.hdr [file.L1T]
-  Import : from hyperion_atm_correction import read_mtl, read_hdr, correct_hyperion
+  GUI    : python hyperspectral_correct.py
+  Script : python hyperspectral_correct.py file.hdr [file.L1T]
+  Import : from hyperspectral_correct import read_mtl, read_hdr, correct_hyperion
 
 Processing chain
 ----------------
@@ -400,14 +400,18 @@ def _coefficients(r6s):
     Stage-1 correction (uniform surface assumption):
         rho_s = (rho_toa - xa) / (xb * rho_toa + xc)
 
-    Stage-2 adjacency correction (spatially variable environment):
-        rho_s2 = (rho_toa - xa) / (xb_down) - rho_env * S / xb_down
-    where xb_down = T_down  and rho_env is a spatially smoothed rho_s.
+    Stage-2 adjacency correction (Tanré et al. 1981, Richter 1990):
+        rho_s2 = rho_s1 + (rho_s1 - rho_env) * f_adj
+        f_adj  = T_dif * S / (1 - S * rho_env)
+    where T_dif = diffuse downward transmittance = sdtott - T_dir,
+          S     = spherical_albedo_tot,
+          rho_env = Gaussian-smoothed Stage-1 reflectance image.
 
     Returns
     -------
     xa, xb, xc        : stage-1 coefficients
-    T_down, T_up, S   : needed for the stage-2 formula
+    T_down (sdtott), T_up (sutott), S (spherical_albedo_tot) : needed for Stage-2.
+    T_dir is stored separately in T_dir_arr (ground_direct_fraction * sdtott).
 
     Note on xa = srotot and the 6S formula:
         srotot is the path reflectance output from the 6S SOS solver.
@@ -589,9 +593,10 @@ def correct_hyperion(params, log=print):
     xa        = np.zeros(n_bands)
     xb        = np.ones(n_bands)
     xc        = np.zeros(n_bands)
-    T_down_arr = np.ones(n_bands)   # downward transmittance, needed for stage 2
-    T_up_arr   = np.ones(n_bands)   # upward transmittance, needed for stage 2
-    S_arr      = np.zeros(n_bands)  # spherical albedo, needed for stage 2
+    T_down_arr = np.ones(n_bands)   # sdtott: total downward transmittance
+    T_up_arr   = np.ones(n_bands)   # sutott: total upward transmittance (retained for future use)
+    S_arr      = np.zeros(n_bands)  # spherical_albedo_tot
+    T_dir_arr  = np.ones(n_bands)   # direct-beam downward transmittance (ground_direct_fraction * sdtott)
 
     # TOA solar irradiance from the 6S built-in solar spectrum (no extra run).
     # solirr(wl_um) returns W/m2/um at 1 AU; correct for Earth-Sun distance.
@@ -655,6 +660,9 @@ def correct_hyperion(params, log=print):
         try:
             r = run6S(io.StringIO(inp), io.StringIO())
             xa[b], xb[b], xc[b], T_down_arr[b], T_up_arr[b], S_arr[b] = _coefficients(r)
+            # Direct-beam downward transmittance = ground_direct_fraction * sdtott
+            # (ground_direct_fraction = direct/(direct+diffuse) fraction of surface irradiance)
+            T_dir_arr[b] = r.get("ground_direct_fraction", 1.0) * T_down_arr[b]
             _spec_rows.append((
                 wl_nm[b],
                 r.get("atm_radiance",      float("nan")),
@@ -900,27 +908,35 @@ def correct_hyperion(params, log=print):
     # ══════════════════════════════════════════════════════════════════════════
     # STAGE 2 — Adjacency correction
     # ══════════════════════════════════════════════════════════════════════════
-    # The Stage-1 output assumes every pixel is surrounded by a uniform surface
-    # of the same reflectance as the pixel itself (inhomo=0) or a fixed
-    # environment type (inhomo=1, igrou2).  Neither accounts for spatial
-    # variation in the surrounding reflectance.
+    # The atmospheric adjacency effect arises because diffuse upwelling photons
+    # originating from the surroundings are rescattered by the atmosphere toward
+    # the sensor, mixing a fraction of the environment signal into every pixel.
     #
-    # Stage 2 estimates the "environmental reflectance" rho_env(x,y) for each
-    # pixel by Gaussian-smoothing the Stage-1 surface reflectance image with a
-    # kernel whose sigma is derived from the adjacency radius.  This captures the
-    # influence of the neighbourhood reflectance on the measured signal.
+    # Physical model (Tanré et al. 1981, Richter 1990):
+    #   rho_toa = xa + T_dir * T_up * rho_s / (1 - S*rho_s)
+    #           + T_dif * T_up * rho_env / (1 - S*rho_env)
+    # where T_dir = direct-beam downward transmittance,
+    #       T_dif = diffuse downward transmittance  (sdtott - T_dir),
+    #       T_up  = total upward transmittance (sutott),
+    #       S     = spherical albedo (spherical_albedo_tot),
+    #       rho_env = spatially averaged environment reflectance (PSF-weighted).
     #
-    # The corrected reflectance is:
-    #   rho_s2 = (rho_toa - xa) / T_down  -  rho_env * S / T_down
-    #          = (rho_s1 * T_up * T_down + xc * T_down * rho_s1
-    #             - S * rho_env) / T_down
-    # Simplified from first principles (Vermote & Tanré 1992):
-    #   rho_s2 = (rho_toa - xa) / T_down  -  S * rho_env / T_down
-    # which equals rho_s1 when rho_env == rho_s1 (uniform surface).
+    # Stage-1 used the simplified model (T_dir + T_dif = T_d = sdtott):
+    #   rho_toa = xa + T_d * T_up * rho_s1 / (1 - S*rho_s1)
+    # which assumes rho_env = rho_s1 everywhere.
     #
-    # Gaussian sigma:  sigma_pixels = (radius_km * 1000) / pixel_size_m
-    # The kernel integrates the atmospheric PSF; for low AOT a radius of 0.5-1 km
-    # is typical, for heavy aerosol up to 3-5 km.
+    # The adjacency correction adjusts for the actual rho_env:
+    #   rho_s2 ≈ rho_s1 + (rho_s1 - rho_env) * f_adj
+    # where:
+    #   f_adj = T_dif * S / (1 - S * rho_env)   [Richter 1990, eq. 3]
+    #
+    # For AOT=0.06 at 427nm: T_dif≈0.20, S≈0.20, f_adj≈0.04
+    # Effect at a contrasting border (rho_s1=0.02, rho_env=0.40): ~−1.5 pp.
+    # Effect grows with AOT (higher aerosol → more diffuse scattering → larger T_dif).
+    #
+    # Gaussian sigma: the PSF of the atmosphere integrates to ~e-folding scale
+    # l = H_atm / (tau_R + tau_aer) ≈ 8km/0.33 ≈ 24km for clean blue sky.
+    # In practice a radius of 0.5-2 km captures the dominant adjacency contribution.
     if do_adj2 and adj2_out_base:
         from scipy.ndimage import gaussian_filter
         log(f"\nStage-2 adjacency correction  radius={adj2_radius_km:.1f} km ...")
@@ -972,49 +988,33 @@ def correct_hyperion(params, log=print):
             rho_env = gaussian_filter(fill.astype(np.float64), sigma=sigma
                                        ).astype(np.float32)
 
-            # Stage-2 adjacency correction
+            # Adjacency correction — Tanré et al. (1981), Richter (1990):
             #
-            # Stage-1 used the uniform-surface assumption: every pixel is
-            # surrounded by a surface of identical reflectance.  The forward
-            # model (Vermote et al. 1997, eq. 2) for a NON-UNIFORM surface is:
+            #   rho_s2 = rho_s1 + (rho_s1 - rho_env) * f_adj
+            #   f_adj  = T_dif * S / (1 - S * rho_env)
             #
-            #   rho_toa = xa + T_up * T_down * rho_pixel / (1 - S * rho_env)
+            # T_dif = sdtott - T_dir  (diffuse downward transmittance)
+            # T_dir = ground_direct_fraction * sdtott  (stored in T_dir_arr)
+            # S     = spherical_albedo_tot             (stored in S_arr)
             #
-            # where rho_env is the effective background reflectance seen by the
-            # atmosphere (here approximated as the Gaussian-smoothed Stage-1 image).
-            #
-            # Solving for rho_pixel:
-            #   rho_pixel = (rho_toa - xa) * (1 - S * rho_env) / (T_up * T_down)
-            #             = (rho_toa - xa) * (1 - S * rho_env) * xb
-            #   (since xb = 1 / (T_down * T_up))
-            #
-            # When rho_env = rho_pixel (uniform case) this reduces exactly to
-            # the Stage-1 formula.
-            #
-            # Step 1: recover rho_toa per pixel by exactly inverting Stage-1.
-            #   The EXACT Stage-1 forward model (from eq. 2) is:
-            #     rho_toa = xa + (T_d*T_u*rho_s1) / (1 - S*rho_s1)
-            #   Exact inverse:
-            #     rho_toa = xa + rho_s1*(1/xb) / (1 - S*rho_s1)
-            #             = [xa*(1-S*rho_s1) + rho_s1/xb] / (1 - S*rho_s1)
-            #
-            # Note: the Vermote approximation rho_toa=(xa+xc*rho_s1)/(1-xb*rho_s1)
-            # is NOT the exact inverse. Using the exact form avoids round-trip error.
+            # f_adj is the fraction of the environment signal that leaks into
+            # the pixel via atmospheric diffuse rescattering.  Its magnitude
+            # grows with aerosol load (larger T_dif) and spherical albedo.
+            # For AOT=0.06 at 427 nm: T_dif≈0.19, S≈0.20, f_adj≈0.04
+            # → effect of ~1.5 pp at a dark/bright border (Δrho_env=0.38).
 
-            _xb = xb[b];  _xc = xc[b];  _xa = xa[b]
-            _S  = S_arr[b]
-            _TdTu = 1.0 / _xb   # T_down * T_up
+            _Td  = T_down_arr[b]   # sdtott
+            _S   = S_arr[b]        # spherical_albedo_tot
+            _Tdir = T_dir_arr[b]
+            _Tdif = _Td - _Tdir   # diffuse downward transmittance
 
-            # Exact rho_toa recovery: rho_toa = xa + T_d*T_u*rho_s1/(1-S*rho_s1)
-            denom_inv = 1.0 - _S * rho_s1
             with np.errstate(divide="ignore", invalid="ignore"):
-                rho_toa_rec = np.where(
-                    np.abs(denom_inv) > 1e-6,
-                    _xa + _TdTu * rho_s1 / denom_inv,
-                    np.nan)
+                f_adj = np.where(
+                    np.abs(1.0 - _S * rho_env) > 1e-6,
+                    _Tdif * _S / (1.0 - _S * rho_env),
+                    0.0)
 
-            # Step 2: apply the non-uniform forward model inverted for rho_pixel
-            rho_s2 = (rho_toa_rec - _xa) * (1.0 - _S * rho_env) * _xb
+            rho_s2 = rho_s1 + (rho_s1 - rho_env) * f_adj
             rho_s2 = np.clip(rho_s2, -0.1, 1.5)
 
             # Restore nodata mask and write
@@ -1570,7 +1570,7 @@ def run_gui():
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1:
-        # Script mode: hyperion_atm_correction.py file.hdr [file.L1T]
+        # Script mode: hyperspectral_correct.py file.hdr [file.L1T]
         hdr_path = sys.argv[1]
         mtl_path = sys.argv[2] if len(sys.argv) > 2 else None
         base     = os.path.splitext(hdr_path)[0]
