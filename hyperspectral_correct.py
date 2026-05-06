@@ -115,7 +115,40 @@ ENV_MODELS = {
     "Lake water":    4,
 }
 DEFAULT_ENV = "Vegetation"
-DEFAULT_ENV_RADIUS_KM = 2.0   # typical atmospheric PSF radius at low AOT
+# Recommended Stage-2 Gaussian smoothing radius by AOT range.
+# The atmospheric PSF has a sharp central peak; 0.1-0.5 km captures it
+# for Hyperion 30 m pixels. Larger values wash out spatial variation.
+DEFAULT_ADJ2_RADIUS_BY_AOT = {
+    # AOT upper bound → recommended radius (km)
+    0.10: 0.15,   # very clean: tight PSF, short radius
+    0.25: 0.20,   # clean (typical Finland/boreal)
+    0.50: 0.35,   # moderate aerosol
+    1.00: 0.60,   # hazy
+    9.99: 1.00,   # very hazy / smoke
+}
+
+def _sixs_band_worker(args):
+    """
+    Module-level worker function for parallel 6S band processing.
+    Must be at module level (not a closure) so multiprocessing can pickle it
+    on Windows (spawn-based) as well as Linux (fork-based).
+    args: (band_index, sixs_config_string, n_harmonics)
+    """
+    b_idx, cfg, nh = args
+    from sixs.sixs_main import run6S as _r6s
+    import io as _io
+    r = _r6s(_io.StringIO(cfg), _io.StringIO(), n_harmonics=nh)
+    return b_idx, r
+
+
+def _recommended_adj2_radius(aot550: float) -> float:
+    """Return recommended Stage-2 Gaussian smoothing radius (km) for a given AOT."""
+    for aot_limit, radius in sorted(DEFAULT_ADJ2_RADIUS_BY_AOT.items()):
+        if aot550 <= aot_limit:
+            return radius
+    return 1.0
+
+DEFAULT_ENV_RADIUS_KM = None   # set from AOT at GUI creation; see _recommended_adj2_radius
 
 # ── Sensor profiles ───────────────────────────────────────────────────────────
 # Each profile defines the sensor-specific parameters that do not come from
@@ -451,18 +484,16 @@ def _coefficients(r6s):
     Stage-1 correction (uniform surface assumption):
         rho_s = (rho_toa - xa) / (xb * rho_toa + xc)
 
-    Stage-2 adjacency correction (Tanré et al. 1981, Richter 1990):
-        rho_s2 = rho_s1 + (rho_s1 - rho_env) * f_adj
-        f_adj  = T_dif * S / (1 - S * rho_env)
-    where T_dif = diffuse downward transmittance = sdtott - T_dir,
-          S     = spherical_albedo_tot,
-          rho_env = Gaussian-smoothed Stage-1 reflectance image.
+    Linear retrieval: rho_s = (rho_toa - xa_eff) / TdTu
+    xa_eff = xa + rho_env_model * T_up*S*T_d  (Stage-1 assumed env)
+    xa_eff = xa + rho_env_smoothed * T_up*S*T_d  (Stage-2 actual env).
+    No (1-S*rho_s) denominator: pixel is black in the 6S run.
 
     Returns
     -------
     xa, xb, xc        : stage-1 coefficients
-    T_down (sdtott), T_up (sutott), S (spherical_albedo_tot) : needed for Stage-2.
-    T_dir is stored separately in T_dir_arr (ground_direct_fraction * sdtott).
+    T_down (sdtott), T_up (sutott), S (spherical_albedo_tot) : stored for reference.
+    Stage-2 only uses S_arr (spherical_albedo_tot) directly.
 
     Note on xa = srotot and the 6S formula:
         srotot is the path reflectance output from the 6S SOS solver.
@@ -590,12 +621,13 @@ def correct_hyperion(params, log=print):
     env_model      = params.get("env_model",      None)
     do_adj2        = params.get("do_adj2",        False)
     adj2_out_base  = params.get("adj2_out_base",  None)
-    adj2_radius_km = params.get("adj2_radius_km", 1.0)
+    adj2_radius_km = params.get("adj2_radius_km", 0.2)
     pixel_size_m   = params.get("pixel_size_m",   30.0)  # Hyperion GSD = 30 m
     env_radius_km  = params.get("env_radius_km",  2.0)
     config_file    = params.get("config_file",    None)
     spec_csv_file  = params.get("spec_csv_file",  None)
     n_harmonics    = int(params.get("n_harmonics", 3))
+    n_workers      = int(params.get("n_workers",   1))
     interleave     = params.get("interleave",     "bip").lower().strip()
     drop_bad_bands = params.get("drop_bad_bands", True)
     mask_file      = params.get("mask_file",      None)
@@ -650,9 +682,17 @@ def correct_hyperion(params, log=print):
     xb        = np.ones(n_bands)
     xc        = np.zeros(n_bands)
     T_down_arr = np.ones(n_bands)   # sdtott: total downward transmittance
-    T_up_arr   = np.ones(n_bands)   # sutott: total upward transmittance (retained for future use)
+    T_up_arr   = np.ones(n_bands)   # sutott: total upward transmittance
     S_arr      = np.zeros(n_bands)  # spherical_albedo_tot
-    T_dir_arr  = np.ones(n_bands)   # direct-beam downward transmittance (ground_direct_fraction * sdtott)
+    T_dir_arr  = np.ones(n_bands)   # direct-beam downward transmittance
+
+    # Per-band effective reflectance of the environment model assumed in Stage-1.
+    # Recovered from the 6S inhomo run:
+    #   rho_env_model[b] = ground_env_irr[b] / (S[b] * (dir_irr[b] + dif_irr[b]))
+    # This is the rho_env that the env_model type (e.g. Vegetation) represents
+    # at each wavelength. It varies spectrally (e.g. vegetation is bright in NIR).
+    # If env_model=None (inhomo=0), ground_env_irr=0 so rho_env_model stays 0.
+    rho_env_model_arr = np.zeros(n_bands)
 
     # TOA solar irradiance from the 6S built-in solar spectrum (no extra run).
     # solirr(wl_um) returns W/m2/um at 1 AU; correct for Earth-Sun distance.
@@ -700,6 +740,7 @@ def correct_hyperion(params, log=print):
     _spec_rows = []   # filled during the 6S loop below
 
     log(f"\nRunning 6S for {bbl.sum()} good bands...")
+    band_inputs = []   # list of (band_index, 6S_config_string)
     n_ok = 0
     for b in range(n_bands):
         if bbl[b] == 0:
@@ -713,14 +754,63 @@ def correct_hyperion(params, log=print):
         inp = _make_6s_input(wl, sza, saa, vza, vaa, month, day,
                              idatm, uh2o, uo3, iaer, aot550, target_alt_km,
                              env_model=env_model, env_radius_km=env_radius_km)
+        band_inputs.append((b, inp))
+
+    # ── Dispatch: parallel or sequential ─────────────────────────────────────
+    # _sixs_band_worker is defined at module level so multiprocessing can
+    # pickle it on Windows (spawn-based) as well as Linux (fork-based).
+    import concurrent.futures as _cf
+
+    jobs = [(b, inp, n_harmonics) for b, inp in band_inputs]
+    n_jobs = len(jobs)
+    completed = []
+    if n_workers > 1:
+        log(f"  Launching {n_workers} parallel worker processes...")
+        with _cf.ProcessPoolExecutor(max_workers=n_workers) as pool:
+            futures = {pool.submit(_sixs_band_worker, j): j for j in jobs}
+            for i, fut in enumerate(_cf.as_completed(futures), 1):
+                result = fut.result()
+                completed.append(result)
+                b_done, r_done = result
+                wl_done = wl_um[b_done]
+                # Log every 10th completed band (arrival order, not band order)
+                if i % 10 == 0:
+                    log(f"  {i:3d}/{n_jobs} bands done  "
+                        f"(last: {wl_done*1000:.1f} nm  "
+                        f"xa={r_done.get('srotot',0):.4f})")
+                log(f"__PROGRESS__ {i} {n_jobs}")
+    else:
+        for i, j in enumerate(jobs, 1):
+            result = _sixs_band_worker(j)
+            completed.append(result)
+            b_done, r_done = result
+            wl_done = wl_um[b_done]
+            if i % 10 == 0:
+                log(f"  Band {b_done+1:3d}/{n_bands}  {wl_done*1000:7.1f} nm  "
+                    f"xa={r_done.get('srotot',0):.4f}  "
+                    f"xb={1/(r_done.get('sdtott',1)*r_done.get('sutott',1)):.4f}")
+            log(f"__PROGRESS__ {i} {n_jobs}")
+
+    band_result_map = {b: r for b, r in completed}
+    n_ok = 0
+    for b, inp in sorted(band_inputs, key=lambda x: x[0]):   # process in band order
+        wl = wl_um[b]
         try:
-            r = run6S(io.StringIO(inp), io.StringIO(), n_harmonics=n_harmonics)
+            r = band_result_map[b]
             xa[b], xb[b], xc[b], T_down_arr[b], T_up_arr[b], S_arr[b] = _coefficients(r)
-            # Direct-beam downward transmittance = direct_irr / (E0 * cos_sza).
-            # Note: ground_direct_fraction = dir_irr/(dir_irr+dif_irr), which
-            # differs from T_dir = dir_irr/(E0*cos_sza). Use irradiance directly.
             T_dir_arr[b] = (r.get("ground_direct_irr", 0.0) / (E0_um[b] * cos_sza)
                             if E0_um[b] * cos_sza > 1e-6 else T_down_arr[b])
+
+            # Effective reflectance of the assumed environment model at this band.
+            # ground_env_irr = S * rho_env_model * (direct_irr + diffuse_irr)
+            # Solving for rho_env_model gives the spectral reflectance that the
+            # chosen environment type (Vegetation, Sand, etc.) has at this wavelength.
+            # If env_model=None (inhomo=0), ground_env_irr=0 so rho_env_model=0.
+            _dir_dif = r.get("ground_direct_irr", 0.0) + r.get("ground_diffuse_irr", 0.0)
+            if S_arr[b] * _dir_dif > 1e-6:
+                rho_env_model_arr[b] = r.get("ground_env_irr", 0.0) / (S_arr[b] * _dir_dif)
+            else:
+                rho_env_model_arr[b] = 0.0
             _spec_rows.append((
                 wl_nm[b],
                 r.get("atm_radiance",      float("nan")),
@@ -735,10 +825,6 @@ def correct_hyperion(params, log=print):
             continue
 
         n_ok += 1
-        if n_ok % 10 == 0:
-            log(f"  Band {b+1:3d}/{n_bands}  {wl*1000:7.1f} nm  "
-                f"xa={xa[b]:.4f}  xb={xb[b]:.4f}  xc={xc[b]:.4f}  "
-                f"E0={E0_um[b]:.1f} W/m2/um")
 
     log(f"\n6S done: {n_ok} bands processed.")
 
@@ -885,12 +971,9 @@ def correct_hyperion(params, log=print):
 
     # -- Apply correction band by band, writing directly to output memmap ------
     log(f"Applying correction to {out_n_bands} bands...")
-    _pct1 = -1
+    log("__RESET__")   # reset progress bar for the correction-application phase
     for out_b, b in enumerate(good_idx):
-        pct1 = int((out_b + 1) / out_n_bands * 100)
-        if pct1 // 10 > _pct1 // 10:
-            _pct1 = pct1
-            log(f"  {pct1:3d}%  (band {b+1})")
+        log(f"__PROGRESS__ {out_b + 1} {out_n_bands}")
         # spectral memmap: (lines, samples, bands) — band is last
         raw = in_mm[:, :, b].astype(np.float32)
 
@@ -920,18 +1003,30 @@ def correct_hyperion(params, log=print):
         #   rho_s = (rho_toa - xa) / (T_up*T_down + S*(rho_toa - xa))
         #
         # NOTE: The Vermote (1997) eq. 7 approximation:
-        #   rho_s ≈ (rho_toa - xa) / (xb*rho_toa + xc)
-        # where xb = 1/(T_down*T_up) and xc = S*xb, i.e. denominator = (rho_toa+S)/(T_d*T_u),
-        # is NOT the exact inverse of eq. 2. The exact denominator is T_d*T_u + S*(rho_toa-xa),
-        # not (rho_toa+S)/(T_d*T_u). The approximation underestimates rho_s by 1-6 pp
-        # in the blue band at AOT=0.20, growing with rho_s and with S (spherical albedo).
-        # The exact formula is used here instead.
+        # ── Stage-1 inversion ─────────────────────────────────────────────────
+        # The measured rho_toa contains two contributions:
+        #   (1) Atmospheric path radiance:  xa = srotot  (black-surface run)
+        #   (2) Environment adjacency:      rho_env_model * coeff
+        #       where coeff = T_up * S * T_d  (verified: env_model does not
+        #       change xa, S, T_d, T_u — it only appears in ground_env_irr)
         #
-        # With xb = 1/(T_d*T_u): denominator = 1/xb + S*(rho_toa - xa)
-        numer = rho_toa - xa[b]
-        denom = (1.0 / xb[b]) + S_arr[b] * numer   # exact: T_d*T_u + S*(rho_toa-xa)
+        # By incorporating rho_env_model into the effective xa before inversion,
+        # Stage-1 now correctly accounts for the chosen environment type.
+        # Stage-2 then only needs to correct the residual deviation between
+        # the actual local rho_env_smoothed and this assumed rho_env_model.
+        #
+        # The inhomo forward model is LINEAR in rho_pixel — the pixel is black
+        # in the 6S run so there is no multiple-scattering coupling between
+        # the pixel and the atmosphere (only the environment couples via S):
+        #   rho_toa = xa_eff + TdTu * rho_pixel
+        # Inversion: rho_pixel = (rho_toa - xa_eff) / TdTu
+        # The (1-S*rho_s) denominator of the uniform model does NOT apply.
+        _coeff   = T_up_arr[b] * S_arr[b] * T_down_arr[b]   # T_up*S*T_d
+        xa_eff_b = xa[b] + rho_env_model_arr[b] * _coeff
+        TdTu_b   = T_down_arr[b] * T_up_arr[b]
+        numer = rho_toa - xa_eff_b
         with np.errstate(divide="ignore", invalid="ignore"):
-            rho_s = np.where(np.abs(denom) > 1e-6, numer / denom, 0.0)
+            rho_s = np.where(np.abs(TdTu_b) > 1e-6, numer / TdTu_b, 0.0)
         rho_s = np.clip(rho_s, -0.1, 1.5)
 
         # Scale to int16, apply mask (nodata=-9999 for invalid pixels)
@@ -966,38 +1061,39 @@ def correct_hyperion(params, log=print):
     # ══════════════════════════════════════════════════════════════════════════
     # STAGE 2 — Adjacency correction
     # ══════════════════════════════════════════════════════════════════════════
-    # The atmospheric adjacency effect arises because diffuse upwelling photons
-    # originating from the surroundings are rescattered by the atmosphere toward
-    # the sensor, mixing a fraction of the environment signal into every pixel.
+    # STAGE 2 — Adjacency correction (residual deviation from env_model)
+    # ══════════════════════════════════════════════════════════════════════════
+    # Stage-1 now accounts for the environment model's adjacency contribution
+    # by using xa_eff = xa + rho_env_model * coeff in the inversion.
+    # This exactly removes the adjacency assumed by the chosen env_model type
+    # (e.g. Vegetation, Sand) at every wavelength.
     #
-    # Physical model (Tanré et al. 1981, Richter 1990):
-    #   rho_toa = xa + T_dir * T_up * rho_s / (1 - S*rho_s)
-    #           + T_dif * T_up * rho_env / (1 - S*rho_env)
-    # where T_dir = direct-beam downward transmittance,
-    #       T_dif = diffuse downward transmittance  (sdtott - T_dir),
-    #       T_up  = total upward transmittance (sutott),
-    #       S     = spherical albedo (spherical_albedo_tot),
-    #       rho_env = spatially averaged environment reflectance (PSF-weighted).
+    # Stage-2 corrects the RESIDUAL: pixels whose actual local environment
+    # differs from the assumed env_model. For example, a water body in a
+    # vegetated scene has rho_env_actual < rho_env_model (vegetation), so
+    # Stage-1 over-subtracted adjacency → Stage-2 adds it back.
+    # Conversely, a clearcut in forest has rho_env_actual > rho_env_model
+    # → Stage-1 under-subtracted → Stage-2 reduces further.
     #
-    # Stage-1 used the simplified model (T_dir + T_dif = T_d = sdtott):
-    #   rho_toa = xa + T_d * T_up * rho_s1 / (1 - S*rho_s1)
-    # which assumes rho_env = rho_s1 everywhere.
+    # The linear re-inversion (coeff = T_up * S * T_d per band):
     #
-    # The adjacency correction adjusts for the actual rho_env:
-    #   rho_s2 ≈ rho_s1 + (rho_s1 - rho_env) * f_adj
-    # where:
-    #   f_adj = T_dif * S / (1 - S * rho_env)   [Richter 1990, eq. 3]
+    #   rho_toa  recovered from Stage-1: xa_eff1 + TdTu * rho_s1  (linear!)
+    #   xa_eff2  = xa + rho_env_smoothed * coeff   [actual local environment]
+    #   rho_s2   = (rho_toa - xa_eff2) / TdTu      (linear inversion)
     #
-    # For AOT=0.06 at 427nm: T_dif≈0.20, S≈0.20, f_adj≈0.04
-    # Effect at a contrasting border (rho_s1=0.02, rho_env=0.40): ~−1.5 pp.
-    # Effect grows with AOT (higher aerosol → more diffuse scattering → larger T_dif).
+    # Note: xa = xa[b] (black-surface), xa_eff = xa + rho_env_model * coeff
+    # (used in Stage-1), xa_eff2 = xa + rho_env_smoothed * coeff (used here).
+    # When rho_env_smoothed == rho_env_model: xa_eff2 == xa_eff → rho_s2 == rho_s1.
+    # When rho_env_smoothed == 0 and env_model=None: both stages use xa → xa_eff=xa.
     #
-    # Gaussian sigma: the PSF of the atmosphere integrates to ~e-folding scale
-    # l = H_atm / (tau_R + tau_aer) ≈ 8km/0.33 ≈ 24km for clean blue sky.
-    # In practice a radius of 0.5-2 km captures the dominant adjacency contribution.
+    # Magnitude of Stage-2 residual correction (427nm, AOT=0.06, coeff≈0.137):
+    #   |rho_env_smoothed - rho_env_model| = 0.10 → |Δrho| ≈ 1.4 pp
+    #   |rho_env_smoothed - rho_env_model| = 0.40 → |Δrho| ≈ 5.5 pp
+    # Correction is zero for pixels matching the assumed environment.
     if do_adj2 and adj2_out_base:
         from scipy.ndimage import gaussian_filter
         log(f"\nStage-2 adjacency correction  radius={adj2_radius_km:.1f} km ...")
+        log("__RESET__")   # tell the GUI to reset the progress bar to 0%
 
         sigma = (adj2_radius_km * 1000.0) / pixel_size_m
         log(f"  Gaussian sigma = {sigma:.1f} pixels  "
@@ -1026,60 +1122,70 @@ def correct_hyperion(params, log=print):
         s1_mm  = s1_obj.open_memmap(writable=False)
 
         log(f"  Smoothing and correcting {out_n_bands} bands...")
-        _pct2 = -1
-        for out_b, b in enumerate(good_idx):
-            pct2 = int((out_b + 1) / out_n_bands * 100)
-            if pct2 // 10 > _pct2 // 10:
-                _pct2 = pct2
-                log(f"    {pct2:3d}%  (band {b+1})")
+
+        # Stage-2 is pure NumPy/SciPy — parallelise with threads.
+        # scipy.ndimage.gaussian_filter releases the GIL, so ThreadPoolExecutor
+        # gives real concurrency without process-spawn overhead.
+        import concurrent.futures as _cf2
+
+        def _adj2_band(args):
+            out_b, b = args
             if T_down_arr[b] < 1e-4:
-                continue
+                return out_b, None
 
-            # Stage-1 reflectance for this band (float, nodata=NaN)
             rho_s1 = s1_mm[:, :, out_b].astype(np.float32) / 10000.0
-            rho_s1[rho_s1 < -0.09] = np.nan     # mask nodata
+            rho_s1[rho_s1 < -0.09] = np.nan
 
-            # Environmental reflectance = spatially smoothed Stage-1
-            # NaN pixels are replaced by local mean before smoothing
-            fill = np.where(np.isnan(rho_s1),
-                            np.nanmean(rho_s1), rho_s1)
-            rho_env = gaussian_filter(fill.astype(np.float64), sigma=sigma
-                                       ).astype(np.float32)
+            fill    = np.where(np.isnan(rho_s1), np.nanmean(rho_s1), rho_s1)
+            rho_env = gaussian_filter(fill.astype(np.float64),
+                                      sigma=sigma).astype(np.float32)
 
-            # Adjacency correction — Tanré et al. (1981), Richter (1990):
-            #
-            #   rho_s2 = rho_s1 + (rho_s1 - rho_env) * f_adj
-            #   f_adj  = T_dif * S / (1 - S * rho_env)
-            #
-            # T_dif = sdtott - T_dir  (diffuse downward transmittance)
-            # T_dir = ground_direct_fraction * sdtott  (stored in T_dir_arr)
-            # S     = spherical_albedo_tot             (stored in S_arr)
-            #
-            # f_adj is the fraction of the environment signal that leaks into
-            # the pixel via atmospheric diffuse rescattering.  Its magnitude
-            # grows with aerosol load (larger T_dif) and spherical albedo.
-            # For AOT=0.06 at 427 nm: T_dif≈0.19, S≈0.20, f_adj≈0.04
-            # → effect of ~1.5 pp at a dark/bright border (Δrho_env=0.38).
+            # Exact Stage-2 re-inversion.
+            # Stage-1 used xa_eff = xa + rho_env_model * coeff.
+            # Stage-2 re-inverts using xa_eff2 = xa + rho_env_smoothed * coeff
+            # (the actual local environment).
+            # When rho_env_smoothed == rho_env_model, rho_s2 == rho_s1 (no change).
+            _xa    = xa[b]
+            _S     = S_arr[b]
+            _TdTu  = T_down_arr[b] * T_up_arr[b]
+            _coeff = T_up_arr[b] * _S * T_down_arr[b]   # T_up * S * T_d
 
-            _Td  = T_down_arr[b]   # sdtott
-            _S   = S_arr[b]        # spherical_albedo_tot
-            _Tdir = T_dir_arr[b]
-            _Tdif = _Td - _Tdir   # diffuse downward transmittance
+            # xa used in Stage-1 (includes assumed environment model)
+            xa_eff1 = _xa + rho_env_model_arr[b] * _coeff
 
             with np.errstate(divide="ignore", invalid="ignore"):
-                f_adj = np.where(
-                    np.abs(1.0 - _S * rho_env) > 1e-6,
-                    _Tdif * _S / (1.0 - _S * rho_env),
-                    0.0)
+                # Recover rho_toa from Stage-1 (linear forward model):
+                #   rho_toa = xa_eff1 + TdTu * rho_s1
+                # No (1-S*rho_s) denominator: pixel is black in the 6S run.
+                rho_toa = xa_eff1 + _TdTu * rho_s1
+                # Re-invert with actual rho_env (also linear):
+                xa_eff2 = _xa + rho_env * _coeff
+                numer   = rho_toa - xa_eff2
+                rho_s2  = np.where(np.abs(_TdTu) > 1e-6, numer / _TdTu, rho_s1)
 
-            rho_s2 = rho_s1 + (rho_s1 - rho_env) * f_adj
             rho_s2 = np.clip(rho_s2, -0.1, 1.5)
 
-            # Restore nodata mask and write
             band_out = np.clip(rho_s2 * 10000, -32768, 32767).astype(np.int16)
             band_out[np.isnan(rho_s1)] = -9999
             band_out[~valid] = -9999
-            adj2_mm[:, :, out_b] = band_out
+            return out_b, band_out
+
+        jobs2 = list(enumerate(good_idx))
+        n_threads = max(1, n_workers)   # reuse the same n_workers setting
+        with _cf2.ThreadPoolExecutor(max_workers=n_threads) as pool:
+            futures = {pool.submit(_adj2_band, j): j for j in jobs2}
+            done = 0
+            _pct2 = -1
+            for fut in _cf2.as_completed(futures):
+                out_b, band_out = fut.result()
+                done += 1
+                pct2 = int(done / out_n_bands * 100)
+                if pct2 // 10 > _pct2 // 10:
+                    _pct2 = pct2
+                    log(f"    {pct2:3d}%  ({done}/{out_n_bands} bands)")
+                log(f"__PROGRESS__ {done} {out_n_bands}")
+                if band_out is not None:
+                    adj2_mm[:, :, out_b] = band_out
 
         log("    100%  done.")
         adj2_mm.flush()
@@ -1497,6 +1603,22 @@ def run_gui():
     ttk.Label(aerg, text="AOT @ 550 nm:").grid(row=1, column=0, sticky=tk.W, pady=3)
     _entry(aerg, "aot550", 0.06, width=10, row=1, column=1, sticky=tk.W, padx=6)
 
+    def _update_radius_from_aot(event=None):
+        """Sync both Stage-1 patch radius and Stage-2 Gaussian radius to the AOT-recommended value."""
+        try:
+            aot = float(e["aot550"].get())
+            suggested = _recommended_adj2_radius(aot)
+            for key in ("adj2_radius_km", "env_radius_km"):
+                cur = e.get(key)
+                if cur is not None:
+                    cur.delete(0, tk.END)
+                    cur.insert(0, f"{suggested:.2f}")
+        except (ValueError, KeyError):
+            pass
+
+    e["aot550"].bind("<FocusOut>", _update_radius_from_aot)
+    e["aot550"].bind("<Return>",   _update_radius_from_aot)
+
     # Target
     tg = ttk.LabelFrame(tab2, text="Target", padding=8)
     tg.pack(fill=tk.X, pady=(0, 10))
@@ -1513,7 +1635,7 @@ def run_gui():
            width=32, row=0, column=1, sticky=tk.W, padx=6, columnspan=2)
 
     ttk.Label(envg, text="Patch radius (km):").grid(row=1, column=0, sticky=tk.W, pady=3)
-    _entry(envg, "env_radius_km", DEFAULT_ENV_RADIUS_KM, width=10,
+    _entry(envg, "env_radius_km", _recommended_adj2_radius(0.06), width=10,
            row=1, column=1, sticky=tk.W, padx=6)
     ttk.Label(envg, text="radius of uniform target patch",
               foreground="gray").grid(row=1, column=2, sticky=tk.W)
@@ -1528,7 +1650,7 @@ def run_gui():
     # Smoothing radius
     ttk.Label(adj2g, text="Smoothing radius (km):").grid(row=0, column=0, sticky=tk.W, pady=2)
     adj2_radius_e = ttk.Entry(adj2g, width=10)
-    adj2_radius_e.insert(0, "0.2")
+    adj2_radius_e.insert(0, f"{_recommended_adj2_radius(0.06):.2f}")
     adj2_radius_e.grid(row=0, column=1, sticky=tk.W, padx=4)
     e["adj2_radius_km"] = adj2_radius_e
     ttk.Label(adj2g, text="Gaussian smoothing radius for rho_env. 0.1-0.5 km recommended for Hyperion 30 m pixels.",
@@ -1548,16 +1670,25 @@ def run_gui():
     sosg.pack(fill=tk.X, pady=(8, 0))
 
     ttk.Label(sosg, text="Fourier harmonics:").grid(row=0, column=0, sticky=tk.W)
-    harmonics_var = tk.StringVar(value="3")
-    harmonics_cb  = ttk.Combobox(sosg, textvariable=harmonics_var, width=6,
-                                  state="readonly",
-                                  values=["1", "2", "3", "4", "6", "8", "10",
-                                          "15", "20", "40", "81"])
-    harmonics_cb.grid(row=0, column=1, sticky=tk.W, padx=6)
-    e["n_harmonics"] = harmonics_var
+    harmonics_cb = _combo(sosg, "n_harmonics",
+                          values=["1", "2", "3", "4", "6", "8", "10", "15", "20", "40", "81"],
+                          default="3", width=6,
+                          row=0, column=1, sticky=tk.W, padx=6)
     ttk.Label(sosg,
               text="3 = exact for Rayleigh, AOT<0.5  |  ≥6 for heavy aerosol  |  81 = Fortran default",
               foreground="gray").grid(row=0, column=2, sticky=tk.W)
+
+    ttk.Label(sosg, text="Worker processes:").grid(row=1, column=0, sticky=tk.W, pady=(4,0))
+    import os as _os
+    n_cpu = _os.cpu_count() or 1
+    workers_cb = _combo(sosg, "n_workers",
+                        values=[str(i) for i in
+                                [1, 2, 4, 8, 16, 32] if i <= n_cpu*2],
+                        default="1", width=6,
+                        row=1, column=1, sticky=tk.W, padx=6)
+    ttk.Label(sosg,
+              text=f"1 = sequential (safe)  |  {n_cpu} = all cores  — each band runs in its own process",
+              foreground="gray").grid(row=1, column=2, sticky=tk.W, pady=(4,0))
 
     # ═══════════════════════════════════════════════
     # TAB 3 — Log
@@ -1570,17 +1701,72 @@ def run_gui():
                   command=log_text.yview).pack(side=tk.RIGHT, fill=tk.Y)
 
     # ── Run button ────────────────────────────────────────────────────
+    # ── Threading infrastructure ──────────────────────────────────────────────
+    import queue as _queue
+    import threading as _threading
+
+    _log_queue   = _queue.Queue()   # log messages: worker thread → GUI
+    _worker_thread = [None]         # reference to running thread
+
+    # Progress bar (indeterminate pulse while running)
+    prog_bar = ttk.Progressbar(btn_bar, mode="determinate", length=220, maximum=100)
+
+    def _poll_log():
+        """Drain the log queue every 100 ms in the GUI thread."""
+        try:
+            while True:
+                msg = _log_queue.get_nowait()
+                if msg is None:       # sentinel: worker finished
+                    prog_bar["value"] = 100
+                    root.after(400, prog_bar.pack_forget)
+                    run_btn.config(state=tk.NORMAL)
+                    stop_btn.config(state=tk.DISABLED)
+                    return
+                if msg.startswith("__PROGRESS__ "):
+                    _, done_s, total_s = msg.split()
+                    pct = int(int(done_s) / int(total_s) * 100)
+                    prog_bar["value"] = pct
+                    continue
+                if msg == "__RESET__":
+                    prog_bar["value"] = 0
+                    continue
+                log_text.insert(tk.END, msg + "\n")
+                log_text.see(tk.END)
+        except _queue.Empty:
+            pass
+        root.after(100, _poll_log)
+
+    def _worker(params):
+        """Run correct_hyperion in a background thread."""
+        def threadsafe_log(msg, end="\n"):
+            _log_queue.put(msg)
+        try:
+            out_hdr = correct_hyperion(params, log=threadsafe_log)
+            _log_queue.put(f"\n✓ Done → {os.path.basename(out_hdr)}")
+            root.after(0, lambda: set_status(f"Done → {os.path.basename(out_hdr)}"))
+        except Exception as ex:
+            import traceback
+            _log_queue.put(traceback.format_exc())
+            root.after(0, lambda: set_status(f"Error: {ex}"))
+        finally:
+            _log_queue.put(None)   # sentinel
+
     def run_correction():
+        if _worker_thread[0] and _worker_thread[0].is_alive():
+            set_status("Already running — please wait.")
+            return
+
         run_btn.config(state=tk.DISABLED)
+        stop_btn.config(state=tk.NORMAL)
         log_text.delete("1.0", tk.END)
         nb.select(tab3)
         set_status("Running...")
-        root.update()
 
         hdr_path = _get("hdr_file")
         if not hdr_path or not os.path.isfile(hdr_path):
             set_status("Error: HDR file not found.")
             run_btn.config(state=tk.NORMAL)
+            stop_btn.config(state=tk.DISABLED)
             return
 
         try:
@@ -1588,6 +1774,7 @@ def run_gui():
         except Exception as ex:
             set_status(f"HDR error: {ex}")
             run_btn.config(state=tk.NORMAL)
+            stop_btn.config(state=tk.DISABLED)
             return
 
         mask_path = _get("mask_file") or None
@@ -1595,62 +1782,63 @@ def run_gui():
             mask_path = None
 
         params = dict(
-            hdr_file      = hdr_path,
-            out_base      = _get("out_base") or os.path.splitext(hdr_path)[0] + "_6S",
-            acq_date      = f"{_get('month')}/{_get('day')}",
-            start_time    = "",
-            month         = _get("month", int),
-            day           = _get("day",   int),
-            sza           = _get("sza",   float),
-            saa           = _get("saa",   float),
-            vza           = _get("vza",   float),
-            vaa           = _get("vaa",   float),
+            hdr_file       = hdr_path,
+            out_base       = _get("out_base") or os.path.splitext(hdr_path)[0] + "_6S",
+            acq_date       = f"{_get('month')}/{_get('day')}",
+            start_time     = "",
+            month          = _get("month", int),
+            day            = _get("day",   int),
+            sza            = _get("sza",   float),
+            saa            = _get("saa",   float),
+            vza            = _get("vza",   float),
+            vaa            = _get("vaa",   float),
             sensor_name    = _get("sensor_name"),
             input_type     = _get("input_type"),
             rad_scale_spec = _get("rad_scale_spec"),
-            idatm         = ATM_MODELS.get(_get("idatm_name"), 2),
-            uh2o          = _get("uh2o",          float),
-            uo3           = _get("uo3",            float),
-            iaer          = AEROSOL_MODELS.get(_get("iaer_name"), 1),
-            aot550        = _get("aot550",         float),
-            target_alt_km = _get("target_alt_km",  float),
-            mask_file     = mask_path,
-            config_file   = (_get("config_file") or None)
-                            if _get("config_file") not in ("", "<not saved>") else None,
-            spec_csv_file = (_get("spec_csv_file") or None)
-                            if _get("spec_csv_file") not in ("", "<not saved>") else None,
-            interleave      = _get("interleave") or "bip",
-            drop_bad_bands  = _drop[0],
-            do_adj2         = _adj2[0],
-            adj2_out_base   = (_get("adj2_out_base") or None) if _adj2[0] else None,
-            adj2_radius_km  = _get("adj2_radius_km", float),
-            pixel_size_m    = _get("pixel_size_m",   float),
-            n_harmonics     = int(harmonics_var.get()),
-            env_model       = ENV_MODELS.get(_get("env_model_name"), None),
-            env_radius_km = _get("env_radius_km", float),
+            idatm          = ATM_MODELS.get(_get("idatm_name"), 2),
+            uh2o           = _get("uh2o",          float),
+            uo3            = _get("uo3",            float),
+            iaer           = AEROSOL_MODELS.get(_get("iaer_name"), 1),
+            aot550         = _get("aot550",         float),
+            target_alt_km  = _get("target_alt_km",  float),
+            mask_file      = mask_path,
+            config_file    = (_get("config_file") or None)
+                             if _get("config_file") not in ("", "<not saved>") else None,
+            spec_csv_file  = (_get("spec_csv_file") or None)
+                             if _get("spec_csv_file") not in ("", "<not saved>") else None,
+            interleave     = _get("interleave") or "bip",
+            drop_bad_bands = _drop[0],
+            do_adj2        = _adj2[0],
+            adj2_out_base  = (_get("adj2_out_base") or None) if _adj2[0] else None,
+            adj2_radius_km = _get("adj2_radius_km", float),
+            pixel_size_m   = _get("pixel_size_m",   float),
+            n_harmonics    = int(_get("n_harmonics") or 3),
+            n_workers      = int(_get("n_workers")   or 1),
+            env_model      = ENV_MODELS.get(_get("env_model_name"), None),
+            env_radius_km  = _get("env_radius_km", float),
             **{k: hdr_data[k] for k in
                ["n_bands","n_lines","n_samples","wl_nm","wl_um","fwhm_nm",
                 "bbl","envi_meta"]},
         )
 
-        def log(msg, end="\n"):
-            # end= is ignored in the GUI — always appends a new line.
-            log_text.insert(tk.END, msg + "\n")
-            log_text.see(tk.END)
-            root.update()
+        # Clear any stale queue messages
+        while not _log_queue.empty():
+            try: _log_queue.get_nowait()
+            except _queue.Empty: break
 
-        try:
-            out_hdr = correct_hyperion(params, log=log)
-            set_status(f"Done -> {os.path.basename(out_hdr)}")
-        except Exception as ex:
-            import traceback
-            log(traceback.format_exc())
-            set_status(f"Error: {ex}")
-        finally:
-            run_btn.config(state=tk.NORMAL)
+        prog_bar.pack(side=tk.LEFT, padx=(10, 0))
+        prog_bar["value"] = 0
+
+        t = _threading.Thread(target=_worker, args=(params,), daemon=True)
+        _worker_thread[0] = t
+        t.start()
+        root.after(100, _poll_log)
 
     run_btn = ttk.Button(btn_bar, text="Run correction", command=run_correction)
     run_btn.pack(side=tk.LEFT, padx=(0, 6))
+    stop_btn = ttk.Button(btn_bar, text="Stop", state=tk.DISABLED,
+                          command=lambda: set_status("Stop requested — waiting for current band..."))
+    stop_btn.pack(side=tk.LEFT, padx=(0, 6))
     ttk.Button(btn_bar, text="Close",
                command=lambda: (root.quit(), root.destroy())).pack(side=tk.LEFT)
 
