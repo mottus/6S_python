@@ -1680,14 +1680,15 @@ def run_gui():
 
     ttk.Label(sosg, text="Worker processes:").grid(row=1, column=0, sticky=tk.W, pady=(4,0))
     import os as _os
-    n_cpu = _os.cpu_count() or 1
+    n_cpu     = _os.cpu_count() or 1
+    n_default = max(1, (n_cpu + 1) // 2)   # half the cores, rounded up
     workers_cb = _combo(sosg, "n_workers",
                         values=[str(i) for i in
                                 [1, 2, 4, 8, 16, 32] if i <= n_cpu*2],
-                        default="1", width=6,
+                        default=str(n_default), width=6,
                         row=1, column=1, sticky=tk.W, padx=6)
     ttk.Label(sosg,
-              text=f"1 = sequential (safe)  |  {n_cpu} = all cores  — each band runs in its own process",
+              text=f"default={n_default} (½ cores)  |  {n_cpu} = all cores  — each band runs in its own process",
               foreground="gray").grid(row=1, column=2, sticky=tk.W, pady=(4,0))
 
     # ═══════════════════════════════════════════════
