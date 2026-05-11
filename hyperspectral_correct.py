@@ -319,7 +319,15 @@ def read_mtl(mtl_path):
     sza = 90.0 - sun_elevation
     saa = sun_azimuth
 
-    # VZA is always the absolute off-nadir angle (positive in 6S).
+    # VZA: angle from the zenith (vertical) to the direction from target to sensor.
+    # Equivalently: the sensor off-nadir angle (both are the same number because
+    # the target→sensor direction and the sensor nadir direction share the vertical).
+    # 6S parameter "avis": angle in [0°, 90°], always positive.
+    # SENSOR_LOOK_ANGLE in the MTL is signed:
+    #   positive → sensor looks EAST  (sensor is east of ground track)
+    #   negative → sensor looks WEST  (sensor is west of ground track)
+    # The absolute value gives the zenith/off-nadir magnitude (VZA).
+    # The sign is used below to compute VAA (target→sensor azimuth).
     vza = abs(look_angle)
 
     # ── Compute VAA from EO-1 orbit geometry ─────────────────────────────────
@@ -327,10 +335,15 @@ def read_mtl(mtl_path):
     # Background
     # ----------
     # The MTL file provides SENSOR_LOOK_ANGLE with a SIGN but no azimuth:
-    #   positive = looking east of the ground track
-    #   negative = looking west of the ground track
-    # 6S requires the VIEW AZIMUTH (VAA) in degrees from North, clockwise —
-    # the same convention as the solar azimuth (SAA).
+    #   positive = looking east of the ground track (sensor east of target)
+    #   negative = looking west of the ground track (sensor west of target)
+    # 6S requires the VIEW AZIMUTH (VAA, called phiv internally):
+    #   The azimuth of the direction from the TARGET to the SENSOR,
+    #   measured clockwise from North — the same convention as SAA.
+    #   This is NOT the direction the sensor is looking; it is the reverse:
+    #   the direction you would face standing at the target to look up at the sensor.
+    #   For a pushbroom sensor flying SSE on a descending pass and looking east,
+    #   the target→sensor azimuth is approximately ENE (~70°).
     # The correct VAA is the azimuth of the line from the pixel to the sensor,
     # which is perpendicular to the satellite ground track.
     #
@@ -359,10 +372,11 @@ def read_mtl(mtl_path):
     #
     # 6S convention
     # -------------
-    # 6S uses phiv = view azimuth from North, clockwise. Internally it computes
-    # the relative azimuth phi = SAA − VAA, so it is the DIFFERENCE that matters
-    # for path radiance.  Using the physical azimuth of the look direction here
-    # is therefore correct.
+    # 6S parameter phiv = VAA = azimuth of the target→sensor direction,
+    # measured clockwise from North. Internally 6S computes the relative
+    # azimuth phi = |phi0 − phiv| (SAA − VAA), so it is the DIFFERENCE
+    # between solar and view azimuths that drives the scattering geometry.
+    # Using the physical target→sensor azimuth here is correct.
 
     EO1_INCLINATION_DEG = 98.7   # EO-1 orbital inclination (retrograde S-S)
 
@@ -385,11 +399,13 @@ def read_mtl(mtl_path):
     else:
         az_track = 180.0   # fallback: due south (equator or rounding)
 
-    # Cross-track view azimuth: east = +90 from track, west = -90
+    # VAA = target→sensor azimuth, perpendicular to the ground track.
+    # Sensor east of track: target must look NE/E/SE to see sensor → az_track+90°
+    # Sensor west of track: target must look NW/W/SW to see sensor → az_track−90°
     if look_angle >= 0.0:
-        vaa = (az_track + 90.0) % 360.0   # east-looking
+        vaa = (az_track + 90.0) % 360.0   # sensor east → target→sensor azimuth ENE
     else:
-        vaa = (az_track - 90.0) % 360.0   # west-looking
+        vaa = (az_track - 90.0) % 360.0   # sensor west → target→sensor azimuth WNW
 
     return dict(
         acq_date=acq_date, start_time=start_time.strip(),
@@ -439,6 +455,12 @@ def _make_6s_input(wl_um, sza, saa, vza, vaa, month, day,
     """
     Build a 6S input string for one monochromatic wavelength.
 
+    vza          : float — view zenith angle [deg]: angle from the vertical to
+                   the target→sensor direction. Equal to the sensor off-nadir angle.
+                   0° = nadir view, 90° = horizon. Always positive. 6S: "avis".
+    vaa          : float — view azimuth [deg, clockwise from North]: azimuth of
+                   the target→sensor direction (NOT the sensor look direction).
+                   6S: "phiv". Same North-clockwise convention as SAA.
     env_model    : int or None — igrou2 environment surface code (1-4).
                    None means inhomo=0 (uniform surface, no adjacency).
     env_radius_km: float — radius of the target patch in km (inhomo=1 only).
@@ -1501,10 +1523,18 @@ def run_gui():
     gg = ttk.LabelFrame(tab1, text="Geometry  (auto-filled from MTL)", padding=8)
     gg.pack(fill=tk.X, pady=(0, 6))
     for r, (lbl, key, default) in enumerate([
-        ("Solar zenith SZA (deg):", "sza",   ""),   # no default: load from MTL
-        ("Solar azimuth SAA (deg):", "saa",  ""),   # no default: load from MTL
-        ("View zenith VZA (deg):",  "vza",   ""),   # no default: load from MTL
-        ("View azimuth VAA (deg):", "vaa",    0.0), # 0 is correct for pushbroom
+        # SZA: angle from zenith (vertical) to the sun. 0°=overhead, 90°=horizon.
+        # SAA: azimuth of the sun, measured clockwise from North.
+        # VZA: angle from zenith to the target→sensor direction (= sensor off-nadir angle).
+        #      0°=nadir view, positive toward horizon. Same number as nadir angle
+        #      because target→sensor and sensor→nadir share the same vertical.
+        # VAA: azimuth of the target→sensor direction (NOT the sensor look direction),
+        #      clockwise from North. For a pushbroom sensor flying south this is
+        #      ~east or ~west of track depending on which side the sensor tilts.
+        ("Solar zenith SZA (deg):",              "sza",   ""),   # from MTL
+        ("Solar azimuth SAA (deg, N clockwise):", "saa",  ""),   # from MTL
+        ("View zenith VZA (deg, target→sensor):", "vza",   ""),  # from MTL
+        ("View azimuth VAA (deg, target→sensor, N clockwise):", "vaa",    0.0), # from MTL
         ("Month:",                  "month",  ""),  # no default: load from MTL
         ("Day:",                    "day",    ""),  # no default: load from MTL
     ]):

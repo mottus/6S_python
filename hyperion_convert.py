@@ -155,9 +155,10 @@ def convert_hyperion(params, log=print):
     input_path     : str  — .zip archive or folder containing band GeoTIFFs
     out_base       : str  — output base path (no extension)
     interleave     : str  — 'bsq', 'bil', or 'bip'
-    drop_bad_bands : bool — if True (default False), exclude bands where
-                     HYPERION_BBL[i] == 0 from the output cube. The BBL
-                     field in the output ENVI header is updated accordingly.
+    drop_bad_bands     : bool — if True (default False), exclude bands where
+                          HYPERION_BBL[i] == 0 from the output cube.
+    write_flaash_scale : bool — if True, write a FLAASH-compatible scale
+                          factor text file: <out_base>_FLAASH_scale_XXXbands.txt
     output_type    : str  — 'radiance' (default) or 'toa_reflectance'.
                      'radiance': store raw DN as int16, nodata=-9999.
                      'toa_reflectance': convert to TOA reflectance
@@ -179,7 +180,8 @@ def convert_hyperion(params, log=print):
     input_path  = params["input_path"]
     out_base    = params["out_base"]
     interleave  = params["interleave"].lower().strip()
-    drop_bad_bands = params.get("drop_bad_bands", False)
+    drop_bad_bands     = params.get("drop_bad_bands",     False)
+    write_flaash_scale = params.get("write_flaash_scale", False)
     output_type    = params.get("output_type", "radiance").lower().strip()
     refl_scale  = int(params.get("refl_scale", 10000))
     # Use None as sentinel so we can distinguish "not set" from a genuine SZA of 0
@@ -543,6 +545,29 @@ def convert_hyperion(params, log=print):
         log(f"  Image : {out_hdr}")
         log(f"  Mask  : {mask_hdr}")
         log(f"  MTL   : {mtl_dest}")
+
+        # ── Optional FLAASH scale factor file ────────────────────────────────
+        # FLAASH expects a plain text file with exactly one scale factor per
+        # line, in band order — nothing else.  No header, no wavelengths.
+        # Convention: L [uW/cm2/sr/nm] = DN / scale_factor
+        #
+        # Hyperion L1T native scale: L [W/m2/sr/um] = DN / 40 (VNIR), DN / 80 (SWIR)
+        # FLAASH radiance unit: uW/cm2/sr/nm
+        # Unit conversion: 1 W/m2/sr/um = 0.1 uW/cm2/sr/nm
+        #   (×1e6 uW/W, ÷1e4 cm2/m2, ÷1e3 nm/um → ×0.1)
+        # Therefore FLAASH scale factors:
+        #   VNIR: 40 / 0.1 = 400
+        #   SWIR: 80 / 0.1 = 800
+        if write_flaash_scale:
+            flaash_path = os.path.join(os.path.dirname(out_base),
+                                       f"FLAASH_scale_factors_{n_out}bands.txt")
+            with open(flaash_path, "w", newline="\n") as fh:
+                for i in out_band_idx:
+                    # 1-based band ≤70 = VNIR (scale=400), else SWIR (scale=800)
+                    scale = 400.0 if (i + 1) <= 70 else 800.0
+                    fh.write(f"{scale:.1f}\n")
+            log(f"  FLAASH: {flaash_path}")
+
         return out_hdr
 
     finally:
@@ -630,7 +655,7 @@ def run_gui():
         if p:
             _set("input_path", p)
             base = os.path.splitext(p)[0]
-            _set("out_base", base + "_ENVI")
+            _set("out_base", base)
             # Auto-fill geometry from MTL inside the zip
             geo = _peek_mtl(p) if zipfile.is_zipfile(p) else {}
             if geo:
@@ -740,14 +765,45 @@ def run_gui():
     # Bad-band exclusion
     bg = ttk.LabelFrame(tab1, text="Band selection", padding=8)
     bg.pack(fill=tk.X, pady=(6, 0))
-    drop_var = tk.BooleanVar(value=False)
-    ttk.Checkbutton(bg, text="Exclude bad bands (BBL = 0)",
-                    variable=drop_var).grid(row=0, column=0, sticky=tk.W)
+    # ── Checkboxes — use no tk.Variable; manage state via .state() API ───────
+    # ttk.Checkbutton on Windows can start in an indeterminate (grey) state
+    # when a BooleanVar or IntVar is used, because the tristate mode is enabled
+    # by default. The fix: bind NO variable at all, and set the visual state
+    # explicitly with .state(["!alternate", ...]) immediately after creation.
+    # The current value lives in a plain Python list (mutable, not a tk object).
+
+    _drop = [False]   # Exclude bad bands — off by default
+
+    def _drop_toggle():
+        _drop[0] = not _drop[0]
+        drop_cb.state(["!alternate", "selected"] if _drop[0]
+                      else ["!alternate", "!selected"])
+
+    drop_cb = ttk.Checkbutton(bg, text="Exclude bad bands (BBL = 0)",
+                               command=_drop_toggle)
+    drop_cb.grid(row=0, column=0, sticky=tk.W)
+    drop_cb.state(["!alternate", "!selected"])   # start unchecked, no tristate
+
     ttk.Label(bg,
               text=f"  ({sum(1 for b in HYPERION_BBL if b==0)} bands excluded: "
                    f"bands 1-7, 58-76, 225-242)",
               foreground="gray").grid(row=0, column=1, sticky=tk.W)
-    e["drop_bad_bands"] = drop_var
+
+    _flaash = [False]   # Write FLAASH scale file — off by default
+
+    def _flaash_toggle():
+        _flaash[0] = not _flaash[0]
+        flaash_cb.state(["!alternate", "selected"] if _flaash[0]
+                        else ["!alternate", "!selected"])
+
+    flaash_cb = ttk.Checkbutton(bg, text="Write FLAASH scale factor file",
+                                 command=_flaash_toggle)
+    flaash_cb.grid(row=2, column=0, sticky=tk.W)
+    flaash_cb.state(["!alternate", "!selected"])   # start unchecked, no tristate
+
+    ttk.Label(bg,
+              text="  (FLAASH_scale_factors_XXXbands.txt in output folder)",
+              foreground="gray").grid(row=2, column=1, sticky=tk.W)
 
     # ── Log tab ───────────────────────────────────────────────────────────────
     tab2 = ttk.Frame(nb, padding=4)
@@ -774,9 +830,10 @@ def run_gui():
         out_type = _get("output_type") or "radiance"
         params = {
             "input_path":  inp,
-            "out_base":    _get("out_base") or os.path.splitext(inp)[0]+"_ENVI",
+            "out_base":    _get("out_base") or os.path.splitext(inp)[0],
             "interleave":  _get("interleave") or "bsq",
-            "drop_bad_bands": e["drop_bad_bands"].get(),
+            "drop_bad_bands":     _drop[0],
+            "write_flaash_scale": _flaash[0],
             "output_type": out_type,
             "refl_scale":  int(_get("refl_scale") or 10000),
             "sza_deg":     float(_get("sza_deg")) if _get("sza_deg").strip() else None,
@@ -820,7 +877,7 @@ if __name__ == "__main__":
         convert_hyperion({
             "input_path":  sys.argv[1],
             "out_base":    sys.argv[2] if len(sys.argv)>2
-                           else os.path.splitext(sys.argv[1])[0]+"_ENVI",
+                           else os.path.splitext(sys.argv[1])[0],
             "interleave":  sys.argv[3] if len(sys.argv)>3 else "bsq",
             "output_type": sys.argv[4] if len(sys.argv)>4 else "radiance",
             "sza_deg":     float(sys.argv[5]) if len(sys.argv)>5 else None,
