@@ -1963,14 +1963,16 @@ def run_gui():
     import os as _os
     n_cpu     = _os.cpu_count() or 1
     n_default = max(1, (n_cpu + 1) // 2)   # half the cores, rounded up
-    workers_cb = _combo(sosg, "n_workers",
-                        values=[str(i) for i in
-                                [1, 2, 4, 8, 16, 32] if i <= n_cpu*2],
-                        default=str(n_default), width=6,
-                        row=1, column=1, sticky=tk.W, padx=6)
+    ttk.Label(sosg, text="Worker processes:").grid(row=1, column=0, sticky=tk.W, pady=3)
+    workers_sb = tk.Spinbox(sosg, from_=1, to=n_cpu * 2,
+                            increment=1, width=5, justify=tk.CENTER)
+    workers_sb.delete(0, tk.END)
+    workers_sb.insert(0, str(n_default))
+    workers_sb.grid(row=1, column=1, sticky=tk.W, padx=6)
+    e["n_workers"] = workers_sb
     ttk.Label(sosg,
-              text=f"default={n_default} (½ cores)  |  {n_cpu} = all cores  — each band runs in its own process",
-              foreground="gray").grid(row=1, column=2, sticky=tk.W, pady=(4,0))
+              text=f"default={n_default} (½ cores)  |  max useful = {n_cpu}  — each band runs in its own process",
+              foreground="gray").grid(row=1, column=2, sticky=tk.W, pady=(4, 0))
 
     # ═══════════════════════════════════════════════
     # TAB 3 — Log
