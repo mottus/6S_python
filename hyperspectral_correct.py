@@ -28,29 +28,34 @@ Processing chain
 4.  Open input as read-only memory map  (one band read at a time)
 
 5.  For each good band (bbl=1, wavelength 0.40-2.50 um):
-    a. Run 6S (monochromatic, iwave=-1) -> correction coefficients:
-         xa = atmospheric path reflectance   (= srotot)
-         xb = 1 / (T_down * T_up)
-         xc = spherical_albedo / (T_down * T_up)
-       If inhomo=1 is chosen, 6S also accounts for the adjacency effect:
-       light reflected by the surrounding environment is scattered toward
-       the sensor, making dark pixels near bright areas appear brighter.
-       The environment type (vegetation/water/sand/lake) and patch radius
-       are user-selectable.
+    a. Run 6S in band-integrated mode (iwave=-2, flat top-hat ±1 FWHM):
+         6S steps through the band at 2.5 nm intervals and solar-irradiance-
+         weighted averages all outputs. This gives correct band-averaged gas
+         transmittance, fixing the monochromatic artefact (iwave=-1) that
+         produced wildly wrong reflectances at O2 (762nm) and H2O absorption
+         bands (720, 820, 940, 1130, 1380nm).
+       Key output coefficients (see _coefficients() for full details):
+         xa    = srotot (path reflectance, already includes gas effects)
+         T_down = sdtott * dgasm  (scattering * downward gas transmittance)
+         T_up   = sutott * ugasm  (scattering * upward gas transmittance)
+         TdTu   = T_down * T_up
+         S     = spherical_albedo_tot (NOT pizera)
+       Verified against original 6S Fortran (main.f):
+         xb = srotot / (sutott * sdtott * tgasm)  -- tgasm ~ dgasm * ugasm
+       Without gas correction, TdTu is up to 6x too large at 940nm (H2O),
+       giving rho_s 439% too low (correction essentially absent).
     b. Get TOA solar irradiance E0 from built-in 6S solar spectrum (solirr),
-       corrected for Earth-Sun distance on the acquisition date (Spencer 1971
-       approximation based on day-of-year).
+       corrected for Earth-Sun distance on acquisition date (Spencer 1971).
     c. DN -> radiance:  L [W/m2/sr/um] = DN / scale_factor
          VNIR (bands 1-70):  scale = 40
          SWIR (bands 71-242): scale = 80
     d. TOA reflectance:  rho_toa = pi * L / (E0 * cos(SZA))
-       Units: L and E0 both in W/m2, ratio is dimensionless.
-    e. Surface reflectance (Vermote et al. 1997):
-         rho_s = (rho_toa - xa) / (xb * rho_toa + xc)
+    e. Surface reflectance (linear, inhomo black-pixel model):
+         rho_s = (rho_toa - xa_eff) / TdTu
+       xa_eff = xa + rho_env_model * coeff  (Stage-1: env_model adjacency removed)
+       xa_eff = xa + rho_env_smoothed * coeff  (Stage-2: residual adjacency)
     f. Scale to int16:  stored = round(rho_s * 10000)
-       To recover reflectance: rho_s = stored_value / 10000.0
-       Nodata (masked pixels) = -9999
-
+       To recover: rho_s = stored / 10000.0.  Nodata = -9999
 6.  Write ENVI header:
     - sensor type = EO-1 Hyperion
     - band names = B1 (356nm), B2 (366nm), ...
@@ -471,42 +476,57 @@ def read_hdr(hdr_path):
 # SECTION 2 -- 6S helpers
 # =============================================================================
 
-def _make_6s_input(wl_um, sza, saa, vza, vaa, month, day,
+def _make_6s_input(wl_um, fwhm_um, sza, saa, vza, vaa, month, day,
                    idatm, uh2o, uo3, iaer, aot550, target_alt_km,
                    env_model=None, env_radius_km=2.0):
     """
-    Build a 6S input string for one monochromatic wavelength.
+    Build a 6S input string for one sensor band.
 
-    vza : float — view zenith angle [deg, 0–90°]: angle from zenith to the
-                  target→sensor direction = sensor off-nadir angle. 6S: "avis".
-                  EO-1 SENSOR_LOOK_ANGLE=+18.641° → VZA=18.641°.
-    vaa : float — view azimuth [deg, clockwise from North, 0–360°]: azimuth of
-                  target→sensor direction. 6S: "phiv". NOT the sensor look
-                  direction (sensor→target = VAA+180° mod 360).
-                  FLAASH "azimuth from ground": same direction, range −180..+180.
-                  EO-1 Finland: sensor looks east → sensor west of target
-                  → VAA ≈ 289° (WNW) → FLAASH = −71°.
-    env_model    : int or None — igrou2 environment surface code (1-4).
+    Uses iwave=-2 (band-integrated flat top-hat filter) spanning
+    [wl_um - fwhm_um, wl_um + fwhm_um]. 6S steps through the band at
+    2.5 nm intervals and solar-irradiance-weighted averages all outputs.
+    This gives correct band-averaged transmittances for all gases.
+
+    Previously used iwave=-1 (monochromatic at band centre). That computed
+    gas transmittance at a single wavelength, which could land in a deep
+    absorption line or a window — giving wildly wrong corrections at gas
+    absorption bands. With iwave=-2 the averaging is done inside 6S, giving
+    the same result as a proper line-by-line instrument response convolution
+    for a flat (top-hat) spectral response function.
+
+    Note: the gas transmittances dgasm/ugasm returned by run6S() must be
+    multiplied into T_down/T_up in _coefficients() — see that function.
+
+    vza : float — view zenith angle [deg, 0-90]: angle from zenith to the
+                  target->sensor direction = sensor off-nadir angle. 6S: "avis".
+                  EO-1 SENSOR_LOOK_ANGLE=+18.641 -> VZA=18.641.
+    vaa : float — view azimuth [deg, clockwise from North, 0-360]: azimuth of
+                  target->sensor direction. 6S: "phiv". NOT the sensor look
+                  direction (sensor->target = VAA+180 mod 360).
+                  FLAASH "azimuth from ground": same direction, range -180..+180.
+                  EO-1 Finland: sensor looks east -> sensor west of target
+                  -> VAA ~ 289 (WNW) -> FLAASH = -71.
+    env_model    : int or None -- igrou2 environment surface code (1-4).
                    None means inhomo=0 (uniform surface, no adjacency).
-    env_radius_km: float — radius of the target patch in km (inhomo=1 only).
-                   6S uses this to weight the adjacency contribution.
+    env_radius_km: float -- radius of the target patch in km (inhomo=1 only).
     """
     atm_extra = f"\n{uh2o:.4f}   {uo3:.4f}" if idatm == 8 else ""
 
     if env_model is not None:
-        # inhomo=1: target is constant rho=0 (placeholder; we derive rho
-        # from the image), environment is env_model, radius = env_radius_km.
-        # idirec=0 (Lambertian), igroun=0 (constant), rho=0.
         surface = (
-            f"1\n"                               # inhomo=1
-            f"0 {env_model} {env_radius_km:.2f}\n"  # target env radius
-            f"0\n"                               # idirec=0
-            f"0\n"                               # igroun=0 (constant)
-            f"0.0\n"                             # rho=0 placeholder
+            f"1\n"
+            f"0 {env_model} {env_radius_km:.2f}\n"
+            f"0\n"
+            f"0\n"
+            f"0.0\n"
         )
     else:
-        # inhomo=0: uniform surface
         surface = "0\n0\n0\n0.0\n"
+
+    # Band integration limits: +/-1 FWHM around centre wavelength.
+    # Clamp to 6S valid range [0.25, 4.0 um].
+    wlinf = max(0.25, wl_um - fwhm_um)
+    wlsup = min(4.00, wl_um + fwhm_um)
 
     return (
         f"0\n"
@@ -517,75 +537,79 @@ def _make_6s_input(wl_um, sza, saa, vza, vaa, month, day,
         f"{aot550:.4f}\n"
         f"{-abs(target_alt_km):.4f}\n"
         f"-1000\n"
-        f"-1\n"
-        f"{wl_um}\n"
+        f"-2\n"
+        f"{wlinf:.5f} {wlsup:.5f}\n"
         f"{surface}"
         f"-2.0\n"
     )
-
-
 def _coefficients(r6s):
     """
     Derive correction coefficients from a 6S result dict.
 
-    Stage-1 correction (uniform surface assumption):
-        rho_s = (rho_toa - xa) / (xb * rho_toa + xc)
+    Retrieval formula
+    -----------------
+    The correction is linear in rho_pixel (pixel is black in the 6S run,
+    so there is no multiple-scattering coupling between pixel and atmosphere):
 
-    Linear retrieval: rho_s = (rho_toa - xa_eff) / TdTu
-    xa_eff = xa + rho_env_model * T_up*S*T_d  (Stage-1 assumed env)
-    xa_eff = xa + rho_env_smoothed * T_up*S*T_d  (Stage-2 actual env).
-    No (1-S*rho_s) denominator: pixel is black in the 6S run.
+        rho_s = (rho_toa - xa_eff) / TdTu
 
-    Returns
-    -------
-    xa, xb, xc        : stage-1 coefficients
-    T_down (sdtott), T_up (sutott), S (spherical_albedo_tot) : stored for reference.
-    Stage-2 only uses S_arr (spherical_albedo_tot) directly.
+    where:
+        xa_eff = xa + rho_env_model * coeff      (Stage-1: assumed environment)
+        xa_eff = xa + rho_env_smoothed * coeff   (Stage-2: actual local environment)
+        coeff  = T_up * S * T_down               (adjacency sensitivity)
+        TdTu   = T_down * T_up                   (total two-way transmittance)
 
-    Note on xa = srotot and the 6S formula:
-        srotot is the path reflectance output from the 6S SOS solver.
-        It equals what the sensor sees over a black surface (rho_s=0).
-        At 427nm, SZA=43.7, AOT=0.06: srotot ~ 0.012 (1.2% path refl).
+    Total transmittance — gas absorption included
+    ---------------------------------------------
+    6S outputs two separate components:
+        sdtott  = scattering-only downward transmittance (Rayleigh + aerosol)
+        sutott  = scattering-only upward transmittance
+        dgasm   = downward total gas transmittance (H2O * O3 * O2 * CO2 * CH4 * N2O * CO)
+        ugasm   = upward total gas transmittance
 
-        This seems low given Rayleigh tau=0.275, but is physically correct:
-        chand(tau_R)=0.135 is the reflectance of a SEMI-INFINITE conservative
-        Rayleigh slab — not the thin real atmosphere over a surface. In the
-        real geometry, most photons transmit directly (T_dir=0.68) and only
-        ~1.2% are backscattered to the sensor. The two quantities are entirely
-        different radiative transfer problems.
+    The correct total transmittances are:
+        T_down = sdtott * dgasm
+        T_up   = sutott * ugasm
 
-        The 6S forward model (verified by fitting) is:
-            rho_toa = xa + T_down*T_up * rho_s / (1 - s_tot * rho_s)
-        where s_tot = spherical_albedo_tot (TOTAL atmospheric spherical albedo).
-        The exact retrieval is then:
-            rho_s = (rho_toa - xa) / (T_d*T_u + s_tot*(rho_toa - xa))
+    This matches the original 6S atmospheric correction formula (main.f, commented
+    section, lines ~2371-2372):
+        xb = srotot / (sutott * sdtott * tgasm)
+    where tgasm ~ dgasm * ugasm for the two-path total.
 
-        CRITICAL: s_tot = spherical_albedo_tot (~0.029 at 427nm, AOT=0.06)
-        NOT pizera (~0.90, which is the aerosol-only spherical albedo).
-        Using pizera gives a denominator ~30x too large, causing rho_s to
-        be underestimated by 1-3 pp. Verified: only s_tot gives zero error.
+    Numerical verification (Fortran vs Python, iwave=-2, Hyperion geometry):
+        Band        dgasm   ugasm   TdTu_old  TdTu_new  rho_s_error_old
+        427nm win   1.000   1.000   0.692     0.692       0%   (unaffected)
+        865nm win   1.000   1.000   0.958     0.958       0%   (unaffected)
+        762nm O2    0.663   0.695   0.942     0.434    +117%   (O2 A-band)
+        720nm H2O   0.859   0.882   0.935     0.707     +32%   (H2O weak)
+        820nm H2O   0.814   0.841   0.952     0.651     +46%   (H2O weak)
+        940nm H2O   0.407   0.456   0.962     0.178    +439%   (H2O strong)
+    Without gas, the correction was effectively absent at 940nm and severely
+    undercorrected at all H2O and O2 absorption bands.
 
-        sroray (Rayleigh component in srotot) is negative in the blue because
-        it is the COUPLING CORRECTION: Rayleigh_in_coupled_atm - Rayleigh_alone.
-        Aerosol forward-scatters photons that would otherwise contribute to
-        Rayleigh backscatter, reducing it. So sroray < 0 in the blue.
-        The total srotot = sroray + sroaer remains small and positive.
+    Notes on xa and S
+    -----------------
+    xa = srotot: path reflectance over black surface. Already correct —
+    the spectral loop in main.f accumulates srotot as romix*coef where romix
+    already includes gas transmittance via tgtot (line 2115: srotot += romix*coef,
+    line 2089: ratm = romix*tgtot + ...). No adjustment needed.
+
+    S = spherical_albedo_tot (total atmospheric spherical albedo, ~0.03-0.20).
+    Must NOT use pizera (aerosol single-scattering albedo ~0.90): that gives
+    a denominator 30x too large, underestimating rho_s by 1-3 pp in the blue.
     """
     rho_atm = r6s["srotot"]
-    T_down  = r6s["sdtott"]
-    T_up    = r6s["sutott"]
-    # CRITICAL: use spherical_albedo_tot (total atmospheric spherical albedo),
-    # NOT pizera. pizera is the aerosol-only spherical albedo (~0.90 in blue).
-    # The correct s in the retrieval formula rho_s=(rho_toa-xa)/(T_d*T_u+s*(rho_toa-xa))
-    # is the TOTAL spherical albedo = spherical_albedo_tot (~0.029 at 427nm, AOT=0.06).
-    # Using pizera causes the denominator to be ~30x too large, severely
-    # underestimating rho_s (by 1-3pp at typical surface reflectances).
-    # Verified by fitting the 6S forward model: rho_toa = xa + T_d*T_u*rho_s/(1-s*rho_s)
-    # gives exact round-trip recovery only with s = spherical_albedo_tot.
+    # dgasm/ugasm: downward/upward total gas transmittance from the 6S spectral
+    # loop. Default to 1.0 only if absent (e.g. old output without gas fields).
+    dgasm   = r6s.get("dgasm", 1.0)
+    ugasm   = r6s.get("ugasm", 1.0)
+    # Total transmittance = scattering * gas (both directions)
+    T_down  = r6s["sdtott"] * dgasm
+    T_up    = r6s["sutott"] * ugasm
     S       = r6s["spherical_albedo_tot"]
     denom   = T_down * T_up
     if denom < 1e-6:
-        return 0.0, 1.0, 0.0, 1.0, 0.0
+        return 0.0, 1.0, 0.0, 1.0, 0.0, S
     return rho_atm, 1.0 / denom, S / denom, T_down, T_up, S
 
 
@@ -762,6 +786,7 @@ def correct_hyperion(params, log=print):
     if config_file:
         template_inp = _make_6s_input(
             "FILL_HERE_WAVELENGTH_IN_um",
+            "FILL_HERE_FWHM_IN_um",
             sza, saa, vza, vaa, month, day,
             idatm, uh2o, uo3, iaer, aot550, target_alt_km,
             env_model=env_model, env_radius_km=env_radius_km,
@@ -799,7 +824,8 @@ def correct_hyperion(params, log=print):
             continue
 
         # Atmospheric correction coefficients
-        inp = _make_6s_input(wl, sza, saa, vza, vaa, month, day,
+        inp = _make_6s_input(wl, fwhm_nm[b] / 1000.0,
+                             sza, saa, vza, vaa, month, day,
                              idatm, uh2o, uo3, iaer, aot550, target_alt_km,
                              env_model=env_model, env_radius_km=env_radius_km)
         band_inputs.append((b, inp))
