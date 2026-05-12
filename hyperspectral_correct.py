@@ -18,7 +18,8 @@ Processing chain
 
 2.  Build valid-pixel mask
     - External mask file if given (any ENVI file, non-zero = valid)
-    - Auto: pixels where ALL bands are zero (sensor fill / black edges)
+    - Auto: pixels equal to the input HDR "data ignore value" (e.g. -9999
+      from hyperion_convert.py) or where all bands are zero (black border)
 
 3.  Create output file before computation
     - Allocates disk space immediately (int16, interleave managed by spectral)
@@ -324,8 +325,8 @@ def read_mtl(mtl_path):
     # the target→sensor direction and the sensor nadir direction share the vertical).
     # 6S parameter "avis": angle in [0°, 90°], always positive.
     # SENSOR_LOOK_ANGLE in the MTL is signed:
-    #   positive → sensor looks EAST  (sensor is east of ground track)
-    #   negative → sensor looks WEST  (sensor is west of ground track)
+    #   positive → sensor looks EAST  → sensor is WEST of target
+    #   negative → sensor looks WEST  → sensor is EAST of target
     # The absolute value gives the zenith/off-nadir magnitude (VZA).
     # The sign is used below to compute VAA (target→sensor azimuth).
     vza = abs(look_angle)
@@ -335,15 +336,15 @@ def read_mtl(mtl_path):
     # Background
     # ----------
     # The MTL file provides SENSOR_LOOK_ANGLE with a SIGN but no azimuth:
-    #   positive = looking east of the ground track (sensor east of target)
-    #   negative = looking west of the ground track (sensor west of target)
+    #   positive = looking east of the ground track (sensor WEST of target)
+    #   negative = looking west of the ground track (sensor EAST of target)
     # 6S requires the VIEW AZIMUTH (VAA, called phiv internally):
     #   The azimuth of the direction from the TARGET to the SENSOR,
     #   measured clockwise from North — the same convention as SAA.
     #   This is NOT the direction the sensor is looking; it is the reverse:
     #   the direction you would face standing at the target to look up at the sensor.
-    #   For a pushbroom sensor flying SSE on a descending pass and looking east,
-    #   the target→sensor azimuth is approximately ENE (~70°).
+    #   EO-1 descending over Finland: track SSW, SENSOR_LOOK_ANGLE=+18.641°
+    #   → sensor looks east → sensor west of target → VAA ≈ 289° (WNW).
     # The correct VAA is the azimuth of the line from the pixel to the sensor,
     # which is perpendicular to the satellite ground track.
     #
@@ -392,20 +393,41 @@ def read_mtl(mtl_path):
     inc_rad = math.radians(EO1_INCLINATION_DEG)
     lat_rad = math.radians(lat_centre)
 
-    # Descending pass ground track azimuth
+    # Descending pass ground track azimuth.
+    # For inclination i > 90° (retrograde sun-synchronous), the satellite
+    # flies southward with a slight westward component:
+    #   sin(delta) = |cos(i)| / cos(lat)
+    #   az_track = 180° + delta   (SSW, confirmed by observed NNE→SSW strip)
+    # Note: 180° − delta would be the ascending pass (northward, NNE direction).
     ratio = abs(math.cos(inc_rad)) / math.cos(lat_rad)
     if ratio <= 1.0:
-        az_track = 180.0 - math.degrees(math.asin(ratio))
+        az_track = 180.0 + math.degrees(math.asin(ratio))
     else:
-        az_track = 180.0   # fallback: due south (equator or rounding)
+        az_track = 180.0   # fallback: due south
 
-    # VAA = target→sensor azimuth, perpendicular to the ground track.
-    # Sensor east of track: target must look NE/E/SE to see sensor → az_track+90°
-    # Sensor west of track: target must look NW/W/SW to see sensor → az_track−90°
+    # SENSOR_LOOK_ANGLE sign convention:
+    #   positive → sensor looks EAST  → sensor is WEST of target
+    #   negative → sensor looks WEST  → sensor is EAST of target
+    #
+    # VAA = azimuth of target→sensor direction, clockwise from North [0–360°].
+    # 6S parameter phiv uses this directly.
+    # Track runs toward az_track (SSW for EO-1 descending pass).
+    #
+    # Sensor west of target (look_angle > 0):
+    #   target→sensor points westward = az_track + 90°
+    #   EO-1 Finland example: az_track≈199° → VAA≈289° (WNW) → FLAASH = −71° ✓
+    # Sensor east of target (look_angle < 0):
+    #   target→sensor points eastward = az_track − 90°
+    #
+    # FLAASH "azimuth of sensor as viewed from the ground" = same direction as VAA,
+    #   but expressed in range −180..+180 (west = negative).
+    #   Conversion: FLAASH = VAA if VAA <= 180, else VAA − 360.
     if look_angle >= 0.0:
-        vaa = (az_track + 90.0) % 360.0   # sensor east → target→sensor azimuth ENE
+        # sensor looks EAST → sensor WEST of target → target→sensor is westward
+        vaa = (az_track + 90.0) % 360.0   # WNW for EO-1/Finland ≈ 289°
     else:
-        vaa = (az_track - 90.0) % 360.0   # sensor west → target→sensor azimuth WNW
+        # sensor looks WEST → sensor EAST of target → target→sensor is eastward
+        vaa = (az_track - 90.0) % 360.0
 
     return dict(
         acq_date=acq_date, start_time=start_time.strip(),
@@ -455,12 +477,15 @@ def _make_6s_input(wl_um, sza, saa, vza, vaa, month, day,
     """
     Build a 6S input string for one monochromatic wavelength.
 
-    vza          : float — view zenith angle [deg]: angle from the vertical to
-                   the target→sensor direction. Equal to the sensor off-nadir angle.
-                   0° = nadir view, 90° = horizon. Always positive. 6S: "avis".
-    vaa          : float — view azimuth [deg, clockwise from North]: azimuth of
-                   the target→sensor direction (NOT the sensor look direction).
-                   6S: "phiv". Same North-clockwise convention as SAA.
+    vza : float — view zenith angle [deg, 0–90°]: angle from zenith to the
+                  target→sensor direction = sensor off-nadir angle. 6S: "avis".
+                  EO-1 SENSOR_LOOK_ANGLE=+18.641° → VZA=18.641°.
+    vaa : float — view azimuth [deg, clockwise from North, 0–360°]: azimuth of
+                  target→sensor direction. 6S: "phiv". NOT the sensor look
+                  direction (sensor→target = VAA+180° mod 360).
+                  FLAASH "azimuth from ground": same direction, range −180..+180.
+                  EO-1 Finland: sensor looks east → sensor west of target
+                  → VAA ≈ 289° (WNW) → FLAASH = −71°.
     env_model    : int or None — igrou2 environment surface code (1-4).
                    None means inhomo=0 (uniform surface, no adjacency).
     env_radius_km: float — radius of the target patch in km (inhomo=1 only).
@@ -666,8 +691,9 @@ def correct_hyperion(params, log=print):
     log(f"  Month / day    : {month} / {day}")
     log(f"  SZA            : {sza:.3f} deg")
     log(f"  SAA            : {saa:.3f} deg")
-    log(f"  VZA            : {vza:.3f} deg")
-    log(f"  VAA            : {vaa:.3f} deg")
+    log(f"  VZA            : {vza:.3f} deg  (target→sensor from zenith = off-nadir angle)")
+    log(f"  VAA            : {vaa:.3f} deg  (target→sensor azimuth N cw; "
+         f"FLAASH={vaa if vaa<=180 else vaa-360:.1f} deg)")
     log(f"  cos(SZA)       : {cos_sza:.4f}")
     log(f"  Sensor         : {sensor_name}")
     log(f"  Input type     : {input_type}")
@@ -684,7 +710,7 @@ def correct_hyperion(params, log=print):
                      "Uniform (inhomo=0)")
     log(f"  Environment    : {env_label}" +
         (f"  radius={env_radius_km:.1f} km" if env_model is not None else ""))
-    log(f"  Mask file      : {mask_file if mask_file else '(auto: all-zero pixels)'}")
+    log(f"  Mask file      : {mask_file if mask_file else '(auto: data ignore value or all-zero)'}")
     log(f"  6S config out  : {config_file if config_file else '(not saved)'}")
     log(f"  Spectral CSV   : {spec_csv_file if spec_csv_file else '(not saved)'}")
     log(f"  SOS harmonics  : {n_harmonics}")
@@ -984,12 +1010,32 @@ def correct_hyperion(params, log=print):
             mask_file = None
 
     if not mask_file:
-        # Auto-mask: a pixel is invalid if ALL input bands are zero.
-        log("  Building auto-mask (pixels where all bands are zero)...")
-        # spectral memmap is (lines, samples, bands) -> sum bands on axis 2
-        band_sum = in_mm.astype(np.int32).sum(axis=2)  # -> (lines, samples)
-        valid    = band_sum != 0
-        log(f"  Auto-mask: {valid.sum()} / {valid.size} valid pixels")
+        # Auto-mask: invalid pixels are those whose DN equals the input file's
+        # "data ignore value" (commonly -9999 from hyperion_convert.py), OR
+        # where all bands are zero (sensor fill / black border).
+        # Read the ignore value from the input HDR; fall back to zero only.
+        ignore_val = None
+        raw_ignore = envi_meta.get("data ignore value", "").strip()
+        if raw_ignore:
+            try:
+                ignore_val = int(float(raw_ignore))
+            except ValueError:
+                pass
+
+        log("  Building auto-mask...")
+        # Cast to int32 to avoid overflow when summing; Hyperion DNs are int16.
+        band_sum = in_mm.astype(np.int32).sum(axis=2)   # (lines, samples)
+
+        if ignore_val is not None:
+            # Invalid if any band equals the ignore value — use the first band
+            # as a proxy (ignore pixels are fill across all bands)
+            first_band = in_mm[:, :, 0].astype(np.int32)
+            valid = (band_sum != 0) & (first_band != ignore_val)
+            log(f"  Auto-mask: ignore value={ignore_val}, "
+                f"{valid.sum()} / {valid.size} valid pixels")
+        else:
+            valid = band_sum != 0
+            log(f"  Auto-mask (all-zero): {valid.sum()} / {valid.size} valid pixels")
 
     # -- Apply correction band by band, writing directly to output memmap ------
     log(f"Applying correction to {out_n_bands} bands...")
@@ -1528,13 +1574,16 @@ def run_gui():
         # VZA: angle from zenith to the target→sensor direction (= sensor off-nadir angle).
         #      0°=nadir view, positive toward horizon. Same number as nadir angle
         #      because target→sensor and sensor→nadir share the same vertical.
-        # VAA: azimuth of the target→sensor direction (NOT the sensor look direction),
-        #      clockwise from North. For a pushbroom sensor flying south this is
-        #      ~east or ~west of track depending on which side the sensor tilts.
+        # VAA: azimuth of target→sensor direction, clockwise from North [0–360°].
+        #      Sensor looks east (+SENSOR_LOOK_ANGLE) → sensor west of target
+        #      → VAA is westward (~289° for EO-1 Finland). FLAASH: same value
+        #      but −180..+180 (west = negative, e.g. −71° for this scene).
         ("Solar zenith SZA (deg):",              "sza",   ""),   # from MTL
         ("Solar azimuth SAA (deg, N clockwise):", "saa",  ""),   # from MTL
-        ("View zenith VZA (deg, target→sensor):", "vza",   ""),  # from MTL
-        ("View azimuth VAA (deg, target→sensor, N clockwise):", "vaa",    0.0), # from MTL
+        # VZA: angle from zenith to target→sensor direction (= off-nadir angle).
+        # VAA: target→sensor azimuth, N clockwise, 0–360°. FLAASH: (VAA−360) if VAA>180.
+        ("View zenith VZA (deg, 0=nadir):",              "vza",   ""),  # from MTL
+        ("View azimuth VAA (deg, target→sensor, N cw):", "vaa",    0.0), # from MTL
         ("Month:",                  "month",  ""),  # no default: load from MTL
         ("Day:",                    "day",    ""),  # no default: load from MTL
     ]):
