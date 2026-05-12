@@ -386,14 +386,19 @@ def read_mtl(mtl_path):
 
     EO1_INCLINATION_DEG = 98.7   # EO-1 orbital inclination (retrograde S-S)
 
-    # Scene centre latitude from image corner coordinates
+    # Scene centre lat/lon from image corner coordinates
     try:
         lat_centre = (float(raw["IMAGE_UL_CORNER_LAT"]) +
                       float(raw["IMAGE_LL_CORNER_LAT"]) +
                       float(raw["IMAGE_UR_CORNER_LAT"]) +
                       float(raw["IMAGE_LR_CORNER_LAT"])) / 4.0
+        lon_centre = (float(raw["IMAGE_UL_CORNER_LON"]) +
+                      float(raw["IMAGE_LL_CORNER_LON"]) +
+                      float(raw["IMAGE_UR_CORNER_LON"]) +
+                      float(raw["IMAGE_LR_CORNER_LON"])) / 4.0
     except (KeyError, ValueError):
         lat_centre = 50.0   # fallback if corners absent from MTL
+        lon_centre = 25.0
 
     inc_rad = math.radians(EO1_INCLINATION_DEG)
     lat_rad = math.radians(lat_centre)
@@ -438,6 +443,8 @@ def read_mtl(mtl_path):
         acq_date=acq_date, start_time=start_time.strip(),
         month=dt.month, day=dt.day,
         sza=sza, saa=saa, vza=vza, vaa=round(vaa, 1),
+        scene_centre_lat=lat_centre,
+        scene_centre_lon=lon_centre,
         # Legacy fields kept for backward compat; new code uses rad_scale_spec
         scale_vnir=scale_vnir, scale_swir=scale_swir,
         rad_scale_spec=f"split:{scale_vnir}:{scale_swir}:70",
@@ -1326,6 +1333,13 @@ def run_gui():
     # ------------------------------------------------------------------
     e = {}   # key -> Entry or Combobox widget
 
+    # Hidden entry widgets for values loaded from MTL but not shown in the GUI.
+    # Using real (hidden) Entry widgets so _set/_get work uniformly.
+    _hidden_frame = tk.Frame(root)   # never packed — just a parent for hidden widgets
+    for _hkey in ("acq_date", "start_time", "scene_lat", "scene_lon"):
+        _hw = tk.Entry(_hidden_frame)
+        e[_hkey] = _hw
+
     def _set(key, value):
         """Write value into widget, works for Entry and Combobox."""
         w = e[key]
@@ -1412,6 +1426,20 @@ def run_gui():
             ttk.Label(parent, text=hint, foreground="gray").grid(
                 row=row, column=2, sticky=tk.W)
 
+    def _apply_mtl(m):
+        """Apply all fields from a read_mtl() result dict to the GUI."""
+        _set("sza",        round(m["sza"], 3))
+        _set("saa",        round(m["saa"], 3))
+        _set("vza",        round(m["vza"], 3))
+        _set("vaa",        round(m["vaa"], 3))
+        _set("month",      m["month"])
+        _set("day",        m["day"])
+        _set("acq_date",   m["acq_date"])
+        _set("start_time", m["start_time"])
+        _set("scene_lat",  round(m["scene_centre_lat"], 4))
+        _set("scene_lon",  round(m["scene_centre_lon"], 4))
+        _set("rad_scale_spec", m["rad_scale_spec"])
+
     def browse_hdr():
         p = filedialog.askopenfilename(
             title="Select ENVI header (.hdr)",
@@ -1422,6 +1450,12 @@ def run_gui():
                 _set("out_base", os.path.splitext(p)[0] + "_6S")
             # Pre-fill Stage-2 output name
             _set("adj2_out_base", os.path.splitext(p)[0] + "_6Sadj")
+            # Auto-fill log file path
+            log_default = os.path.splitext(p)[0] + "_6Slog.txt"
+            if e["log_file"].get() in ("", "<not saved>"):
+                log_file_entry.config(state=tk.NORMAL)
+                log_file_entry.delete(0, tk.END)
+                log_file_entry.insert(0, log_default)
             # Auto-detect MTL if not already set
             if not _get("mtl_file"):
                 found = find_mtl(p)
@@ -1429,13 +1463,7 @@ def run_gui():
                     _set("mtl_file", found)
                     try:
                         m = read_mtl(found)
-                        _set("sza",   round(m["sza"], 3))
-                        _set("saa",   round(m["saa"], 3))
-                        _set("vza",   round(m["vza"], 3))
-                        _set("vaa",   round(m["vaa"], 3))
-                        _set("month", m["month"])
-                        _set("day",   m["day"])
-                        _set("rad_scale_spec", m["rad_scale_spec"])
+                        _apply_mtl(m)
                         set_status(
                             f"MTL auto-detected: {os.path.basename(found)}  "
                             f"SZA={m['sza']:.2f}  VZA={m['vza']:.2f}")
@@ -1451,14 +1479,7 @@ def run_gui():
         _set("mtl_file", p)
         try:
             m = read_mtl(p)
-            _set("sza",        round(m["sza"], 3))
-            _set("saa",        round(m["saa"], 3))
-            _set("vza",        round(m["vza"], 3))
-            _set("vaa",        round(m["vaa"], 3))
-            _set("month",      m["month"])
-            _set("day",        m["day"])
-            # Update rad_scale_spec if profile still matches Hyperion defaults
-            _set("rad_scale_spec", m["rad_scale_spec"])
+            _apply_mtl(m)
             set_status(
                 f"MTL loaded: {m['acq_date']}  "
                 f"SZA={m['sza']:.2f}  VZA={m['vza']:.2f}")
@@ -1534,6 +1555,24 @@ def run_gui():
     ttk.Label(fg,
               text="atm/env radiance + ground direct/diffuse/env irradiance, W m⁻² µm⁻¹",
               foreground="gray").grid(row=7, column=0, columnspan=3, sticky=tk.W)
+
+    # Log file row
+    def browse_log_file():
+        p = filedialog.asksaveasfilename(
+            title="Save log file as",
+            defaultextension=".txt",
+            filetypes=[("Text", "*.txt"), ("All", "*.*")])
+        if p:
+            _set("log_file", p)
+
+    ttk.Label(fg, text="Save log to file:").grid(row=8, column=0, sticky=tk.W, pady=3)
+    log_file_entry = ttk.Entry(fg)
+    log_file_entry.insert(0, "<not saved>")
+    log_file_entry.grid(row=8, column=1, sticky=tk.EW, padx=4)
+    e["log_file"] = log_file_entry
+    ttk.Button(fg, text="Browse...", command=browse_log_file).grid(row=8, column=2)
+    ttk.Label(fg, text="default: <out_base>_6Slog.txt",
+              foreground="gray").grid(row=9, column=0, columnspan=3, sticky=tk.W)
 
     # ── Checkboxes ──────────────────────────────────────────────────────────
     # All tk variable types (BooleanVar, IntVar) can show an indeterminate
@@ -1708,6 +1747,143 @@ def run_gui():
     ttk.Label(aerg, text="AOT @ 550 nm:").grid(row=1, column=0, sticky=tk.W, pady=3)
     _entry(aerg, "aot550", 0.06, width=10, row=1, column=1, sticky=tk.W, padx=6)
 
+    # ── AERONET retrieval button ───────────────────────────────────────────────
+    aeronet_status = tk.StringVar(value="")
+
+    def _fetch_aeronet():
+        """Retrieve AOT (and H2O/O3 if idatm=8) from the nearest AERONET site."""
+        import threading
+        import datetime as _dt
+
+        def _worker():
+            try:
+                # ── Read scene coordinates and date from the e dict ────────────
+                def _get_val(key):
+                    w = e.get(key)
+                    return w.get().strip() if w and hasattr(w, "get") else ""
+
+                lat_s = _get_val("scene_lat")
+                lon_s = _get_val("scene_lon")
+                date_s = _get_val("acq_date")[:10]   # YYYY-MM-DD
+                # start_time from MTL is "YYYY DOY HH:MM:SS" — extract HH:MM
+                time_s = ""
+                raw_time = _get_val("start_time")
+                import re as _re
+                m_t = _re.search(r'(\d{2}:\d{2}):\d{2}', raw_time)
+                if m_t:
+                    time_s = m_t.group(1)
+
+                if not lat_s or not lon_s:
+                    msg = "AERONET: No scene coordinates — load MTL first."
+                    root.after(0, lambda: aeronet_status.set(msg))
+                    root.after(0, lambda: set_status(msg))
+                    return
+                if not date_s:
+                    msg = "AERONET: No acquisition date — load MTL first."
+                    root.after(0, lambda: aeronet_status.set(msg))
+                    root.after(0, lambda: set_status(msg))
+                    return
+
+                lat = float(lat_s)
+                lon = float(lon_s)
+                date = _dt.date.fromisoformat(date_s)
+                time_utc = None
+                try:
+                    if time_s:
+                        time_utc = _dt.time.fromisoformat(time_s + ":00")
+                except Exception:
+                    pass
+
+                searching = f"AERONET: Searching near ({lat:.2f}N, {lon:.2f}E) on {date_s}…"
+                root.after(0, lambda: aeronet_status.set(searching))
+                root.after(0, lambda: set_status(searching))
+
+                def _append_log(msg):
+                    root.after(0, lambda m=msg: (
+                        log_text.insert(tk.END, m + "\n"),
+                        log_text.see(tk.END)
+                    ))
+
+                # ── Import aeronet_fetch from same directory ────────────────────
+                import importlib.util, os as _os
+                af_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                                        "aeronet_fetch.py")
+                spec = importlib.util.spec_from_file_location("aeronet_fetch", af_path)
+                af   = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(af)
+
+                def _log(msg):
+                    root.after(0, lambda m=msg: aeronet_status.set(m))
+                    _append_log(f"  AERONET: {msg}")
+
+                res = af.retrieve(lat, lon, date, time_utc,
+                                  target_wl_nm=550.0, level="15", log=_log)
+
+                if res["n_aod_obs"] == 0:
+                    msg = "AERONET: No data found for this date/location."
+                    root.after(0, lambda: aeronet_status.set(msg))
+                    root.after(0, lambda: set_status(msg))
+                    _append_log(msg)
+                    return
+
+                aod = res.get("aod_target")
+                pwv = res.get("pwv_cm")
+                o3  = res.get("ozone_du")
+                site = res.get("site", "?")
+                dist = res.get("site_dist_km", 0.0)
+
+                def _fill():
+                    if aod is not None:
+                        e["aot550"].delete(0, tk.END)
+                        e["aot550"].insert(0, f"{aod:.4f}")
+                        _update_radius_from_aot()
+
+                    # Always fill H2O and O3 — even when greyed out (idatm≠8).
+                    # Temporarily enable the widget to write, then restore its
+                    # state. Values are ready when the user switches to idatm=8.
+                    if pwv is not None:
+                        e["uh2o"].config(state=tk.NORMAL)
+                        e["uh2o"].delete(0, tk.END)
+                        e["uh2o"].insert(0, f"{pwv:.3f}")
+                    if o3 is not None:
+                        # Convert Dobson units to cm-atm (1 DU = 0.001 cm-atm)
+                        e["uo3"].config(state=tk.NORMAL)
+                        e["uo3"].delete(0, tk.END)
+                        e["uo3"].insert(0, f"{o3 * 0.001:.4f}")
+                    # Restore disabled state for non-idatm=8 profiles
+                    on_atm_change()
+
+                    is_user = ATM_MODELS.get(e["idatm_name"].get(), 0) == 8
+                    pwv_str  = f"  PWV={pwv:.3f}cm"   if pwv else ""
+                    o3_str   = f"  O3={o3:.0f}DU"     if o3  else ""
+                    h2o_note = "" if is_user else "  (H2O/O3 pre-filled for idatm=8)"
+                    summary = (f"AERONET: {site} ({dist:.0f}km)  AOT={aod:.4f}"
+                               f"{pwv_str}{o3_str}{h2o_note}")
+                    aeronet_status.set(summary)
+                    set_status(summary)
+                    _append_log(f"\n{summary}")
+                    _append_log(f"  → H2O = {pwv:.3f} g/cm2  "
+                                f"O3 = {o3*0.001:.4f} cm-atm ({o3:.1f} DU)"
+                                if (pwv and o3) else
+                                f"  → H2O = {pwv:.3f} g/cm2" if pwv else "")
+
+                root.after(0, _fill)
+
+            except Exception as ex:
+                msg = f"AERONET error: {ex}"
+                root.after(0, lambda: aeronet_status.set(msg))
+                root.after(0, lambda: set_status(msg))
+                _append_log(msg)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    aeronet_btn = ttk.Button(aerg, text="Fetch from AERONET…",
+                             command=_fetch_aeronet)
+    aeronet_btn.grid(row=1, column=2, sticky=tk.W, padx=(8, 0))
+    ttk.Label(aerg, textvariable=aeronet_status,
+              foreground="gray").grid(row=2, column=0, columnspan=4,
+                                       sticky=tk.W, pady=(2, 0))
+
     def _update_radius_from_aot(event=None):
         """Sync both Stage-1 patch radius and Stage-2 Gaussian radius to the AOT-recommended value."""
         try:
@@ -1813,6 +1989,7 @@ def run_gui():
 
     _log_queue   = _queue.Queue()   # log messages: worker thread → GUI
     _worker_thread = [None]         # reference to running thread
+    _log_fh      = [None]           # open log file handle (or None)
 
     # Progress bar (indeterminate pulse while running)
     prog_bar = ttk.Progressbar(btn_bar, mode="determinate", length=220, maximum=100)
@@ -1827,6 +2004,14 @@ def run_gui():
                     root.after(400, prog_bar.pack_forget)
                     run_btn.config(state=tk.NORMAL)
                     stop_btn.config(state=tk.DISABLED)
+                    if _log_fh[0]:
+                        try:
+                            _log_fh[0].write("=== END ===\n")
+                            _log_fh[0].flush()
+                            _log_fh[0].close()
+                        except Exception:
+                            pass
+                        _log_fh[0] = None
                     return
                 if msg.startswith("__PROGRESS__ "):
                     _, done_s, total_s = msg.split()
@@ -1838,6 +2023,13 @@ def run_gui():
                     continue
                 log_text.insert(tk.END, msg + "\n")
                 log_text.see(tk.END)
+                # Write to log file immediately and flush so crash leaves a trail
+                if _log_fh[0]:
+                    try:
+                        _log_fh[0].write(msg + "\n")
+                        _log_fh[0].flush()
+                    except Exception:
+                        pass
         except _queue.Empty:
             pass
         root.after(100, _poll_log)
@@ -1931,6 +2123,65 @@ def run_gui():
         while not _log_queue.empty():
             try: _log_queue.get_nowait()
             except _queue.Empty: break
+
+        # ── Open log file ──────────────────────────────────────────────────
+        log_path = e["log_file"].get().strip()
+        if log_path and log_path not in ("<not saved>", ""):
+            try:
+                _log_fh[0] = open(log_path, "w", encoding="utf-8", buffering=1)
+                import datetime as _dt_log
+                _log_fh[0].write(f"=== 6S Atmospheric Correction Log ===\n")
+                _log_fh[0].write(f"Started: {_dt_log.datetime.now().isoformat(timespec='seconds')}\n")
+                _log_fh[0].write(f"\n--- Input parameters ---\n")
+                # Write all filled fields and checked options
+                for label, key in [
+                    ("HDR file",         "hdr_file"),
+                    ("Output base",      "out_base"),
+                    ("MTL file",         "mtl_file"),
+                    ("Acq. date",        "acq_date"),
+                    ("Start time",       "start_time"),
+                    ("Month / day",      None),
+                    ("SZA (deg)",        "sza"),
+                    ("SAA (deg)",        "saa"),
+                    ("VZA (deg)",        "vza"),
+                    ("VAA (deg)",        "vaa"),
+                    ("Sensor",           "sensor_name"),
+                    ("Input type",       "input_type"),
+                    ("Radiance scale",   "rad_scale_spec"),
+                    ("Atm profile",      "idatm_name"),
+                    ("H2O (g/cm2)",      "uh2o"),
+                    ("O3 (cm-atm)",      "uo3"),
+                    ("Aerosol model",    "iaer_name"),
+                    ("AOT @ 550nm",      "aot550"),
+                    ("Target alt (km)",  "target_alt_km"),
+                    ("Env model",        "env_model_name"),
+                    ("Env radius (km)",  "env_radius_km"),
+                    ("Adj2 radius (km)", "adj2_radius_km"),
+                    ("Pixel size (m)",   "pixel_size_m"),
+                    ("N harmonics",      "n_harmonics"),
+                    ("N workers",        "n_workers"),
+                    ("Interleave",       "interleave"),
+                    ("Mask file",        "mask_file"),
+                    ("6S config file",   "config_file"),
+                    ("Spectral CSV",     "spec_csv_file"),
+                    ("Log file",         "log_file"),
+                    ("Adj2 output",      "adj2_out_base"),
+                ]:
+                    if key is None:
+                        m_val = f"{_get('month')}/{_get('day')}"
+                        _log_fh[0].write(f"  {'Month / day':<22}: {m_val}\n")
+                        continue
+                    val = _get(key)
+                    if val:
+                        _log_fh[0].write(f"  {label:<22}: {val}\n")
+                # Checkboxes
+                _log_fh[0].write(f"  {'Drop bad bands':<22}: {_drop[0]}\n")
+                _log_fh[0].write(f"  {'Stage-2 adjacency':<22}: {_adj2[0]}\n")
+                _log_fh[0].write(f"\n--- Processing log ---\n")
+                _log_fh[0].flush()
+            except Exception as ex:
+                set_status(f"Log file error: {ex}")
+                _log_fh[0] = None
 
         prog_bar.pack(side=tk.LEFT, padx=(10, 0))
         prog_bar["value"] = 0
