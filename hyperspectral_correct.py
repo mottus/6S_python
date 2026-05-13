@@ -637,7 +637,13 @@ def correct_hyperion(params, log=print):
 
     Acquisition geometry (from MTL or supplied directly):
         acq_date, start_time, month, day   (acq_date/start_time may be "")
-        sza, saa, vza, vaa  [degrees]
+        sza, saa [degrees] — solar zenith and azimuth
+        vza [degrees] — view zenith: angle from zenith to target→sensor direction
+                        = sensor off-nadir angle.  0°=nadir.
+        vaa [degrees] — view azimuth: target→sensor direction, clockwise from North.
+                        Positive = sensor east of target (sensor looks west).
+                        SENSOR_LOOK_ANGLE positive → sensor looks east → VAA ~289°.
+                        FLAASH equivalent: (VAA−360) if VAA>180, else VAA.
 
     Sensor / calibration:
         sensor_name   : str — written to output header "sensor type" field
@@ -645,6 +651,8 @@ def correct_hyperion(params, log=print):
                         "toa_refl" — data already is TOA reflectance; skip E0
         rad_scale_spec: str — profile rad_scale string, passed to build_rad_scale()
                         e.g. "split:40:80:70"  or  "uniform:1"  or  "none"
+        interleave    : "bip", "bil", or "bsq" (default "bip")
+        drop_bad_bands: bool — exclude bands where bbl=0 (default True)
 
     Atmospheric correction parameters:
         idatm         [0-8]
@@ -656,11 +664,34 @@ def correct_hyperion(params, log=print):
         n_harmonics   [int, default 3 — Fourier azimuth harmonics for SOS;
                        3 = exact for Rayleigh, <0.02% error for AOT<0.5;
                        increase to 6-10 for heavy aerosol or asymmetric phase fn]
+        n_workers     [int, default 1 — parallel 6S worker processes]
 
-    mask_file : str or None (optional)
-        Path to a single-band binary mask image (same spatial extent as input,
-        any dtype; non-zero = valid pixel).  If None, a mask is derived
-        automatically: pixels where ALL bands are zero are treated as nodata.
+    Environment / adjacency (Stage-1):
+        env_model     : int or None — igrou2 surface type for inhomo 6S run.
+                        None = inhomo=0 (no adjacency in Stage-1).
+                        1=Vegetation, 2=ClearWater, 3=Sand, 4=LakeWater.
+                        Stage-1 removes this environment's adjacency contribution
+                        by including rho_env_model in xa_eff.
+        env_radius_km : float — Stage-1 patch radius (km), default 0.2.
+                        Controls PSF weighting of environment vs target in 6S.
+
+    Stage-2 adjacency correction (optional):
+        do_adj2       : bool — enable Stage-2 Gaussian adjacency correction.
+        adj2_out_base : str or None — output path for Stage-2 result.
+        adj2_radius_km: float — Gaussian smoothing radius (km) for rho_env.
+                        Should equal env_radius_km. Both updated together from AOT.
+        pixel_size_m  : float — pixel size in metres (default 30.0 for Hyperion).
+                        Used to convert adj2_radius_km to sigma in pixels.
+
+    Optional outputs:
+        mask_file     : str or None — external single-band mask (non-zero = valid).
+                        Auto-mask: pixels equal to HDR "data ignore value" (−9999)
+                        or where all bands are zero (black border).
+        config_file   : str or None — path to save the 6S configuration as text.
+        spec_csv_file : str or None — path to save per-band atmospheric quantities:
+                        wavelength, atm_radiance, env_radiance,
+                        ground_direct_irr, ground_diffuse_irr, ground_env_irr
+                        [W m⁻² µm⁻¹].
 
     log : callable for progress output (default: print)
     """
@@ -1456,6 +1487,10 @@ def run_gui():
                 log_file_entry.config(state=tk.NORMAL)
                 log_file_entry.delete(0, tk.END)
                 log_file_entry.insert(0, log_default)
+            # Auto-fill spectral CSV path
+            csv_default = os.path.splitext(p)[0] + "_spectral.csv"
+            if not e["spec_csv_file"].get():
+                _set("spec_csv_file", csv_default)
             # Auto-detect MTL if not already set
             if not _get("mtl_file"):
                 found = find_mtl(p)
@@ -1542,13 +1577,11 @@ def run_gui():
             defaultextension=".csv",
             filetypes=[("CSV", "*.csv"), ("All", "*.*")])
         if p:
-            spec_csv_entry.config(state=tk.NORMAL)
             _set("spec_csv_file", p)
 
-    ttk.Label(fg, text="Save spectral CSV:").grid(row=6, column=0, sticky=tk.W, pady=3)
+    ttk.Label(fg, text="Spectral CSV:").grid(row=6, column=0, sticky=tk.W, pady=3)
     spec_csv_entry = ttk.Entry(fg)
-    spec_csv_entry.insert(0, "<not saved>")
-    spec_csv_entry.config(state=tk.DISABLED)
+    spec_csv_entry.insert(0, "")
     spec_csv_entry.grid(row=6, column=1, sticky=tk.EW, padx=4)
     e["spec_csv_file"] = spec_csv_entry
     ttk.Button(fg, text="Browse...", command=browse_spec_csv).grid(row=6, column=2)
@@ -1593,7 +1626,7 @@ def run_gui():
     drop_cb = ttk.Checkbutton(fg,
                                text="Exclude bad bands from output  (saves disk space)",
                                command=_drop_toggle)
-    drop_cb.grid(row=8, column=0, columnspan=3, sticky=tk.W, pady=(6, 2))
+    drop_cb.grid(row=10, column=0, columnspan=3, sticky=tk.W, pady=(6, 2))
     drop_cb.state(["!alternate", "selected"])   # clear alternate, set ticked
 
     # Enable Stage-2 adjacency correction — on by default
@@ -1609,7 +1642,7 @@ def run_gui():
     adj2_cb = ttk.Checkbutton(fg,
                                text="Enable Stage-2 adjacency correction",
                                command=on_adj2_toggle)
-    adj2_cb.grid(row=9, column=0, columnspan=3, sticky=tk.W, pady=(0, 4))
+    adj2_cb.grid(row=11, column=0, columnspan=3, sticky=tk.W, pady=(0, 4))
     adj2_cb.state(["!alternate", "selected"])   # clear alternate, set ticked
 
     # Apply initial enable state (Stage-2 on -> fields active)
@@ -1755,6 +1788,18 @@ def run_gui():
         import threading
         import datetime as _dt
 
+        # If already running, clicking the button aborts the current fetch
+        if _aeronet_abort[0] is not None:
+            _aeronet_abort[0][0] = True
+            aeronet_btn.config(text="Fetch from AERONET…")
+            _aeronet_abort[0] = None
+            aeronet_status.set("AERONET fetch aborted.")
+            return
+
+        abort_flag = [False]
+        _aeronet_abort[0] = abort_flag
+        aeronet_btn.config(text="Abort fetching")
+
         def _worker():
             try:
                 # ── Read scene coordinates and date from the e dict ────────────
@@ -1817,7 +1862,8 @@ def run_gui():
                     _append_log(f"  AERONET: {msg}")
 
                 res = af.retrieve(lat, lon, date, time_utc,
-                                  target_wl_nm=550.0, level="15", log=_log)
+                                  target_wl_nm=550.0, level="15",
+                                  log=_log, abort_flag=abort_flag)
 
                 if res["n_aod_obs"] == 0:
                     msg = "AERONET: No data found for this date/location."
@@ -1874,8 +1920,13 @@ def run_gui():
                 root.after(0, lambda: aeronet_status.set(msg))
                 root.after(0, lambda: set_status(msg))
                 _append_log(msg)
+            finally:
+                _aeronet_abort[0] = None
+                root.after(0, lambda: aeronet_btn.config(text="Fetch from AERONET…"))
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    _aeronet_abort = [None]   # holds the current abort_flag list, or None if idle
 
     aeronet_btn = ttk.Button(aerg, text="Fetch from AERONET…",
                              command=_fetch_aeronet)

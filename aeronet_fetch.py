@@ -374,7 +374,8 @@ def dump_raw(site: str, date, level: str = "15", product: str = "aod") -> str:
     return _parse_csv(_fetch(AOD_URL, params))
 
 
-def fetch_aod(site: str, date: datetime.date, level: str = "15") -> list:
+def fetch_aod(site: str, date: datetime.date, level: str = "15",
+              timeout: int = 15) -> list:
     """Retrieve all AOD measurement rows for one site on one day."""
     level_key = {"10": "AOD10", "15": "AOD15", "20": "AOD20"}.get(level, "AOD15")
     params = {
@@ -383,10 +384,11 @@ def fetch_aod(site: str, date: datetime.date, level: str = "15") -> list:
         "year2": date.year, "month2": date.month, "day2": date.day,
         level_key: 1, "AVG": 10, "if_no_html": 1,
     }
-    return _parse_csv(_fetch(AOD_URL, params))
+    return _parse_csv(_fetch(AOD_URL, params, timeout=timeout))
 
 
-def fetch_pwv_ozone(site: str, date: datetime.date, level: str = "15") -> list:
+def fetch_pwv_ozone(site: str, date: datetime.date, level: str = "15",
+                    timeout: int = 15) -> list:
     level_key = {"10": "ALM10", "15": "ALM15", "20": "ALM20"}.get(level, "ALM15")
     params = {
         "site": site,
@@ -394,21 +396,22 @@ def fetch_pwv_ozone(site: str, date: datetime.date, level: str = "15") -> list:
         "year2": date.year, "month2": date.month, "day2": date.day,
         "product": "PWV", level_key: 1, "AVG": 10, "if_no_html": 1,
     }
-    return _parse_csv(_fetch(INV_URL, params))
+    return _parse_csv(_fetch(INV_URL, params, timeout=timeout))
 
 
 def retrieve_from_site(site_info: dict,
                         date: datetime.date,
                         time_utc: datetime.time | None,
                         target_wl_nm: float,
-                        level: str) -> dict:
+                        level: str,
+                        timeout: int = 15) -> dict:
     """
     Attempt retrieval from one specific site.
     Returns a result dict; n_aod_obs == 0 means no data.
     """
     name = site_info["name"]
-    aod_rows = fetch_aod(name, date, level)
-    pwv_rows = fetch_pwv_ozone(name, date, level)
+    aod_rows = fetch_aod(name, date, level, timeout=timeout)
+    pwv_rows = fetch_pwv_ozone(name, date, level, timeout=timeout)
     target_hour = (time_utc.hour + time_utc.minute/60 + time_utc.second/3600
                    if time_utc else None)
 
@@ -484,49 +487,88 @@ def retrieve(lat: float, lon: float,
              target_wl_nm: float = 550.0,
              level: str = "15",
              force_site: str | None = None,
-             log=None) -> dict:
+             log=None,
+             abort_flag: list | None = None,
+             max_retries: int = 3,
+             timeout: int = 15) -> dict:
     """
     Find the nearest AERONET site with data for the given date.
-    If force_site is given, try that site first, then fall through to
-    nearest sites if it has no data.
-    Calls log(msg) with progress messages if provided.
-    Returns the result dict from the first site with data, plus a
-    'search_log' list documenting each attempt.
+
+    abort_flag : a one-element list [False]; set abort_flag[0]=True from
+                 another thread to stop the search cleanly.
+    max_retries: number of times to retry the same site on timeout before
+                 moving to the next site (default 3).
+    timeout    : per-request timeout in seconds (default 15).
+
+    Logic:
+      - Timeout / network error → retry the same site (up to max_retries).
+      - Empty response (no data) → move to next site.
+      - abort_flag[0] set       → stop immediately and return empty result.
     """
+    import urllib.error
+
     if log is None:
         log = lambda _: None
+    if abort_flag is None:
+        abort_flag = [False]
 
     ordered = sites_by_distance(lat, lon, force_site=force_site, log=log)
     search_log = []
 
     for site_info in ordered:
+        if abort_flag[0]:
+            msg = "Search aborted by user."
+            log(msg); search_log.append(msg)
+            break
+
         name = site_info["name"]
         dist = site_info.get("dist_km", 0.0)
-        msg  = f"Trying {name} ({dist:.0f} km)…"
-        log(msg)
-        search_log.append(msg)
 
-        try:
-            res = retrieve_from_site(site_info, date, time_utc, target_wl_nm, level)
-        except Exception as ex:
-            msg = f"  {name}: error — {ex}"
-            log(msg)
-            search_log.append(msg)
-            continue
+        res = None
+        for attempt in range(1, max_retries + 1):
+            if abort_flag[0]:
+                break
 
-        if res["n_aod_obs"] == 0:
-            msg = f"  {name}: no data for {date}."
-            log(msg)
-            search_log.append(msg)
+            if attempt == 1:
+                msg = f"Trying {name} ({dist:.0f} km)…"
+            else:
+                msg = f"  {name}: retry {attempt}/{max_retries}…"
+            log(msg); search_log.append(msg)
+
+            try:
+                res = retrieve_from_site(site_info, date, time_utc,
+                                         target_wl_nm, level,
+                                         timeout=timeout)
+                break   # got a response (may be empty) — don't retry
+
+            except (TimeoutError, urllib.error.URLError) as ex:
+                msg = f"  {name}: timeout ({ex}) — {'retrying' if attempt < max_retries else 'giving up'}"
+                log(msg); search_log.append(msg)
+                if attempt == max_retries:
+                    res = None   # exhausted retries → treat as no data, try next site
+                # loop continues for retry
+
+            except Exception as ex:
+                msg = f"  {name}: error — {ex}"
+                log(msg); search_log.append(msg)
+                res = None
+                break   # non-timeout error → skip to next site immediately
+
+        if abort_flag[0]:
+            break
+
+        if res is None or res["n_aod_obs"] == 0:
+            if res is not None:
+                msg = f"  {name}: no data for {date}."
+                log(msg); search_log.append(msg)
             continue
 
         msg = f"  {name}: {res['n_aod_obs']} observations found."
-        log(msg)
-        search_log.append(msg)
+        log(msg); search_log.append(msg)
         res["search_log"] = search_log
         return res
 
-    # No site found
+    # No site found or aborted
     return dict(
         site=None, date=date, time_utc=time_utc, level=level,
         target_wl_nm=target_wl_nm,
