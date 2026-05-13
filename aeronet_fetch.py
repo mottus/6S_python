@@ -177,10 +177,13 @@ def fetch_site_list(local: bool = True, log=None) -> list:
     """
     Load the AERONET site list. Cached in memory after the first call.
 
-    local=True  (default): read from aeronet_sites.txt bundled with this module.
-                           Fast, no network required.
-    local=False:           download the full list (~1400 sites) from AERONET.
-                           Use update_site_list() to also save it to disk.
+    local=True  (default): read from aeronet_sites.txt next to this module.
+                           If the file is absent, downloads automatically from
+                           the AERONET server and saves it to disk for future
+                           use (same as calling update_site_list()).
+    local=False:           always download the full list (~1400 sites) from
+                           AERONET without saving. Use update_site_list() to
+                           also save it to disk.
 
     Returns list of dicts: {name, lat, lon, elev}.
     """
@@ -193,15 +196,30 @@ def fetch_site_list(local: bool = True, log=None) -> list:
             log(f"Loading site list from {_os.path.basename(SITES_LOCAL)}…")
         with open(SITES_LOCAL, encoding="utf-8") as f:
             text = f.read()
+        save_to_disk = False
     else:
-        if log:
+        if local and log:
+            log(f"aeronet_sites.txt not found — downloading from server…")
+        elif log:
             log("Downloading AERONET site list…")
         text = _fetch(SITES_URL)
+        save_to_disk = local   # save only when local was requested but file was missing
 
     sites = _parse_site_text(text)
     _SITES_CACHE = sites
-    if log:
+
+    if save_to_disk:
+        try:
+            with open(SITES_LOCAL, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+            if log:
+                log(f"  Saved {len(sites)} sites to {_os.path.basename(SITES_LOCAL)}.")
+        except Exception as ex:
+            if log:
+                log(f"  Warning: could not save site list ({ex}).")
+    elif log:
         log(f"  {len(sites)} AERONET sites loaded.")
+
     return sites
 
 
@@ -542,11 +560,24 @@ def retrieve(lat: float, lon: float,
                 break   # got a response (may be empty) — don't retry
 
             except (TimeoutError, urllib.error.URLError) as ex:
-                msg = f"  {name}: timeout ({ex}) — {'retrying' if attempt < max_retries else 'giving up'}"
-                log(msg); search_log.append(msg)
-                if attempt == max_retries:
-                    res = None   # exhausted retries → treat as no data, try next site
-                # loop continues for retry
+                if attempt < max_retries:
+                    msg = f"  {name}: timeout — retrying ({attempt}/{max_retries})…"
+                    log(msg); search_log.append(msg)
+                    # loop continues for retry
+                else:
+                    msg = (f"  {name}: timeout after {max_retries} attempts — "
+                           f"server unreachable, stopping search.")
+                    log(msg); search_log.append(msg)
+                    # Do NOT advance to next site — if this site timed out,
+                    # other sites will too. Return so the user can act.
+                    return dict(
+                        site=None, date=date, time_utc=time_utc, level=level,
+                        target_wl_nm=target_wl_nm,
+                        aod_target=None, alpha=float("nan"),
+                        aod_440=None, aod_500=None, aod_675=None, aod_870=None,
+                        pwv_cm=None, ozone_du=None, n_aod_obs=0,
+                        aod_rows=[], pwv_rows=[], search_log=search_log,
+                    )
 
             except Exception as ex:
                 msg = f"  {name}: error — {ex}"

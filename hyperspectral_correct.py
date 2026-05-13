@@ -2082,7 +2082,11 @@ def run_gui():
                         _log_fh[0].write(msg + "\n")
                         _log_fh[0].flush()
                     except Exception:
-                        pass
+                        try:
+                            _log_fh[0].close()
+                        except Exception:
+                            pass
+                        _log_fh[0] = None
         except _queue.Empty:
             pass
         root.after(100, _poll_log)
